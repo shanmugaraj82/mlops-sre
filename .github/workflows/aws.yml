@@ -146,17 +146,21 @@ jobs:
           PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
           echo "Waiting for SSH on ${PUBLIC_DNS}:22..."
 
+          # Try up to 30 times (~5 minutes) to open an SSH session and run 'echo ok'
           for i in {1..30}; do
-            echo "Attempt $i: checking SSH..."
-            if timeout 5 bash -c "echo >/dev/tcp/${PUBLIC_DNS}/22" 2>/dev/null; then
-              echo "SSH is reachable."
+            echo "Attempt $i: trying SSH handshake..."
+
+            if ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                  -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" 'echo ok' 2>/dev/null; then
+              echo "SSH is fully ready and accepting connections."
               exit 0
             fi
+
             echo "SSH not ready yet, sleeping 10 seconds..."
             sleep 10
           done
 
-          echo "SSH not reachable after multiple attempts."
+          echo "SSH not reachable/ready after multiple attempts."
           exit 1
 
       - name: Install Jenkins on EC2 via SSH
@@ -239,7 +243,7 @@ jobs:
           for i in {1..20}; do
             echo "Attempt $i: checking for /var/lib/jenkins/secrets/initialAdminPassword..."
 
-            if ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "test -f /var/lib/jenkins/secrets/initialAdminPassword"; then
+            if ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "sudo test -f /var/lib/jenkins/secrets/initialAdminPassword"; then
               echo "Password file found. Fetching..."
 
               ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" \
