@@ -103,7 +103,7 @@ jobs:
 
           echo "Launching EC2 instance in subnet ${SUBNET_ID} with SG ${SG_ID} and key pair ${KEY_NAME}..."
 
-          INSTANCE_ID=$(aws ec2.run-instances \
+          INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "${AMI_ID}" \
             --instance-type "${INSTANCE_TYPE}" \
             --subnet-id "${SUBNET_ID}" \
@@ -127,6 +127,9 @@ jobs:
 
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
           echo "public_dns=${PUBLIC_DNS}" >> "$GITHUB_OUTPUT"
+
+
+
 
       - name: Output instance info
         run: |
