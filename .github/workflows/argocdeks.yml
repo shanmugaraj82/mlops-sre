@@ -13,6 +13,11 @@ jobs:
       ARGOCD_NAMESPACE: argocd
       # Git repo that will be managed by Argo CD (public repo works without auth)
       ARGOCD_APP_REPO_URL: https://github.com/shanmugaraj82/argocd-app.git  # <-- change to your repo
+      # Argo CD Application configuration
+      ARGOCD_APP_NAME: demo-app
+      ARGOCD_APP_PATH: manifests          # folder inside the repo
+      ARGOCD_APP_DEST_NAMESPACE: default  # where app will be deployed
+
 
     steps:
       - name: Checkout repo
@@ -189,6 +194,57 @@ jobs:
               --password "${ARGOCD_REPO_PASSWORD}" \
               --upsert
           fi
+      - name: Ensure destination namespace exists
+        env:
+          ARGOCD_APP_DEST_NAMESPACE: ${{ env.ARGOCD_APP_DEST_NAMESPACE }}
+        run: |
+          if ! kubectl get namespace "${ARGOCD_APP_DEST_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Creating namespace ${ARGOCD_APP_DEST_NAMESPACE}..."
+            kubectl create namespace "${ARGOCD_APP_DEST_NAMESPACE}"
+          else
+            echo "Namespace ${ARGOCD_APP_DEST_NAMESPACE} already exists."
+          fi
+      - name: Create & auto-sync Argo CD Application
+        env:
+          ARGOCD_APP_NAME: ${{ env.ARGOCD_APP_NAME }}
+          ARGOCD_APP_REPO_URL: ${{ env.ARGOCD_APP_REPO_URL }}
+          ARGOCD_APP_PATH: ${{ env.ARGOCD_APP_PATH }}
+          ARGOCD_APP_DEST_NAMESPACE: ${{ env.ARGOCD_APP_DEST_NAMESPACE }}
+        run: |
+          if [ -z "${ARGOCD_APP_REPO_URL}" ]; then
+            echo "ARGOCD_APP_REPO_URL is not set."
+            exit 1
+          fi
+
+          echo "Creating/updating Argo CD Application ${ARGOCD_APP_NAME}..."
+
+          # Check if app already exists
+          if argocd app get "${ARGOCD_APP_NAME}" >/dev/null 2>&1; then
+            echo "Application ${ARGOCD_APP_NAME} already exists. Updating sync policy to automated..."
+            argocd app set "${ARGOCD_APP_NAME}" \
+              --sync-policy automated \
+              --self-heal \
+              --auto-prune
+
+            echo "Triggering sync for ${ARGOCD_APP_NAME}..."
+            argocd app sync "${ARGOCD_APP_NAME}"
+          else
+            echo "Application ${ARGOCD_APP_NAME} does not exist. Creating..."
+            argocd app create "${ARGOCD_APP_NAME}" \
+              --repo "${ARGOCD_APP_REPO_URL}" \
+              --path "${ARGOCD_APP_PATH}" \
+              --dest-server "https://kubernetes.default.svc" \
+              --dest-namespace "${ARGOCD_APP_DEST_NAMESPACE}" \
+              --project default \
+              --sync-policy automated \
+              --self-heal \
+              --auto-prune
+
+            echo "Triggering initial sync for ${ARGOCD_APP_NAME}..."
+            argocd app sync "${ARGOCD_APP_NAME}"
+          fi
+
+          echo "Application ${ARGOCD_APP_NAME} is configured for automated sync from ${ARGOCD_APP_REPO_URL}/${ARGOCD_APP_PATH}"
 
 
       # OPTIONAL: Template for creating an Argo CD Application (disabled by default)
