@@ -9,7 +9,7 @@ jobs:
 
     env:
       AWS_REGION: us-east-1
-      CLUSTER_NAME: demo-eks-cluster      # <-- change if your cluster name is different
+      CLUSTER_NAME: demoraj2-eks-cluster      # <-- change if your cluster name is different
       ARGOCD_NAMESPACE: argocd
       # Git repo that will be managed by Argo CD (public repo works without auth)
       ARGOCD_APP_REPO_URL: https://github.com/your-org/argocd-app.git  # <-- change to your repo
