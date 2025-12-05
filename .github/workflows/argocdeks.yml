@@ -1,4 +1,4 @@
-name: Install Argo CD on EKS
+name: Install & Configure Argo CD on EKS
 
 on:
   workflow_dispatch: {}   # Run manually from GitHub Actions UI
@@ -9,8 +9,10 @@ jobs:
 
     env:
       AWS_REGION: us-east-1
-      CLUSTER_NAME: demoraj2-eks-cluster      # <-- change if your cluster name is different
+      CLUSTER_NAME: demo-eks-cluster      # <-- change if your cluster name is different
       ARGOCD_NAMESPACE: argocd
+      # Git repo that will be managed by Argo CD (public repo works without auth)
+      ARGOCD_APP_REPO_URL: https://github.com/your-org/argocd-app.git  # <-- change to your repo
 
     steps:
       - name: Checkout repo
@@ -90,7 +92,9 @@ jobs:
           echo "For port-forward (local testing), you can run:"
           echo "  kubectl port-forward svc/argocd-server -n ${ARGOCD_NAMESPACE} 8080:443"
           echo "Then open: https://localhost:8080"
+
       - name: Expose Argo CD via LoadBalancer
+        id: expose-argocd
         run: |
           export KUBECONFIG="$HOME/.kube/config"
 
@@ -101,17 +105,96 @@ jobs:
             }
           }'
 
-          echo "Waiting for LoadBalancer external IP..."
+          echo "Waiting for LoadBalancer external hostname..."
           for i in {1..30}; do
             EXTERNAL_IP=$(kubectl get svc argocd-server -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
             if [ -n "$EXTERNAL_IP" ]; then
               echo "Argo CD is available at: https://$EXTERNAL_IP"
+              echo "hostname=$EXTERNAL_IP" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Still waiting for external IP... ($i/30)"
+            echo "Still waiting for external IP/hostname... ($i/30)"
             sleep 10
           done
 
           echo "Timed out waiting for Argo CD LoadBalancer external IP."
           kubectl get svc argocd-server -n "${ARGOCD_NAMESPACE}"
           exit 1
+
+      - name: Install Argo CD CLI
+        run: |
+          # Pin a specific version or adjust as needed
+          ARGOCD_VERSION="v2.13.0"
+          echo "Installing Argo CD CLI version ${ARGOCD_VERSION}..."
+          curl -sSL -o argocd "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Login to Argo CD
+        env:
+          ARGOCD_SERVER_HOST: ${{ steps.expose-argocd.outputs.hostname }}
+        run: |
+          if [ -z "${ARGOCD_SERVER_HOST}" ]; then
+            echo "ARGOCD_SERVER_HOST not set. Check the 'Expose Argo CD via LoadBalancer' step."
+            exit 1
+          fi
+
+          if [ ! -f argocd_admin_password.txt ]; then
+            echo "argocd_admin_password.txt not found. Make sure 'Get Argo CD initial admin password' ran successfully."
+            exit 1
+          fi
+
+          echo "Logging in to Argo CD at ${ARGOCD_SERVER_HOST}..."
+          argocd login "${ARGOCD_SERVER_HOST}" \
+            --username admin \
+            --password "$(cat argocd_admin_password.txt)" \
+            --insecure
+
+      - name: Register current EKS cluster in Argo CD
+        run: |
+          CURRENT_CONTEXT="$(kubectl config current-context)"
+          echo "Current kubectl context: ${CURRENT_CONTEXT}"
+          echo "Adding current cluster to Argo CD (if not already present)..."
+
+          if argocd cluster list | grep -q "${CURRENT_CONTEXT}"; then
+            echo "Cluster ${CURRENT_CONTEXT} is already registered in Argo CD."
+          else
+            argocd cluster add "${CURRENT_CONTEXT}" --yes
+          fi
+
+      - name: Register Git repo in Argo CD
+        env:
+          ARGOCD_APP_REPO_URL: ${{ env.ARGOCD_APP_REPO_URL }}
+        run: |
+          if [ -z "${ARGOCD_APP_REPO_URL}" ]; then
+            echo "ARGOCD_APP_REPO_URL is not set. Set it in the workflow env section."
+            exit 1
+          fi
+
+          echo "Registering Git repo ${ARGOCD_APP_REPO_URL} in Argo CD (idempotent)..."
+          if argocd repo list | grep -q "${ARGOCD_APP_REPO_URL}"; then
+            echo "Repo ${ARGOCD_APP_REPO_URL} is already registered."
+          else
+            # For public repos, this is enough. For private repos, add --username / --password or --ssh-private-key-path.
+            argocd repo add "${ARGOCD_APP_REPO_URL}"
+          fi
+
+      # OPTIONAL: Template for creating an Argo CD Application (disabled by default)
+      # - name: Create sample Argo CD Application
+      #   run: |
+      #     ARGOCD_APP_NAME="sample-app"              # change if needed
+      #     ARGOCD_APP_REPO_URL="${ARGOCD_APP_REPO_URL}"
+      #     ARGOCD_APP_REPO_PATH="."                  # path in the repo where the manifests/helm chart live
+      #     ARGOCD_APP_DEST_NAMESPACE="default"       # target namespace for app deployment
+      #
+      #     echo "Creating Argo CD Application ${ARGOCD_APP_NAME}..."
+      #     argocd app create "${ARGOCD_APP_NAME}" \
+      #       --repo "${ARGOCD_APP_REPO_URL}" \
+      #       --path "${ARGOCD_APP_REPO_PATH}" \
+      #       --dest-server "https://kubernetes.default.svc" \
+      #       --dest-namespace "${ARGOCD_APP_DEST_NAMESPACE}" \
+      #       --project default
+      #
+      #     # Uncomment to auto-sync (deploy) the app:
+      #     # argocd app sync "${ARGOCD_APP_NAME}"
