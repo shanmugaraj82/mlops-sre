@@ -166,9 +166,17 @@ jobs:
       - name: Register Git repo in Argo CD
         env:
           ARGOCD_APP_REPO_URL: ${{ env.ARGOCD_APP_REPO_URL }}
+          # GitHub token with repo read access (stored as a GitHub Actions secret)
+          ARGOCD_REPO_USERNAME: git
+          ARGOCD_REPO_PASSWORD: ${{ secrets.ARGOCD_REPO_TOKEN }}
         run: |
           if [ -z "${ARGOCD_APP_REPO_URL}" ]; then
             echo "ARGOCD_APP_REPO_URL is not set. Set it in the workflow env section."
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_REPO_PASSWORD}" ]; then
+            echo "ARGOCD_REPO_PASSWORD (ARGOCD_REPO_TOKEN secret) is not set."
             exit 1
           fi
 
@@ -176,9 +184,12 @@ jobs:
           if argocd repo list | grep -q "${ARGOCD_APP_REPO_URL}"; then
             echo "Repo ${ARGOCD_APP_REPO_URL} is already registered."
           else
-            # For public repos, this is enough. For private repos, add --username / --password or --ssh-private-key-path.
-            argocd repo add "${ARGOCD_APP_REPO_URL}"
+            argocd repo add "${ARGOCD_APP_REPO_URL}" \
+              --username "${ARGOCD_REPO_USERNAME}" \
+              --password "${ARGOCD_REPO_PASSWORD}" \
+              --upsert
           fi
+
 
       # OPTIONAL: Template for creating an Argo CD Application (disabled by default)
       # - name: Create sample Argo CD Application
