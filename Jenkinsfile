@@ -2,12 +2,12 @@ pipeline {
   agent any
 
   environment {
-    AWS_REGION    = 'us-east-1'
-    CLUSTER_NAME  = 'demo-eks-cluster'
-    EKS_VERSION   = '1.29'        // adjust as needed
-    NODEGROUP_NAME = 'ng-default'
-    NODE_TYPE      = 't3.small'
-    NODE_COUNT     = '2'
+    AWS_REGION      = 'us-east-1'
+    CLUSTER_NAME    = 'demo-eks-cluster'
+    EKS_VERSION     = '1.29'        // adjust as needed
+    NODEGROUP_NAME  = 'ng-default'
+    NODE_TYPE       = 't3.small'
+    NODE_COUNT      = '2'
   }
 
   stages {
@@ -17,13 +17,8 @@ pipeline {
       }
     }
 
-    stage('Configure AWS CLI & eksctl') {
+    stage('Install AWS CLI, eksctl & kubectl (no sudo)') {
       steps {
-        // Jenkins Credentials:
-        // Create a "Username with password" credential in Jenkins with:
-        //   ID: aws-jenkins-creds
-        //   Username: AWS_ACCESS_KEY_ID
-        //   Password: AWS_SECRET_ACCESS_KEY
         withCredentials([
           usernamePassword(
             credentialsId: 'aws-jenkins-creds',
@@ -34,29 +29,53 @@ pipeline {
           sh '''
             set -e
 
-            echo "[SETUP] Verifying AWS CLI installation..."
+            echo "[SETUP] Preparing $HOME/bin..."
+            mkdir -p "$HOME/bin"
+            export PATH="$HOME/bin:$PATH"
+
+            echo "[SETUP] Ensuring AWS region env vars..."
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[SETUP] Checking AWS CLI..."
             if ! command -v aws >/dev/null 2>&1; then
-              echo "[SETUP] AWS CLI not found. Installing AWS CLI v2..."
-              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              echo "[SETUP] AWS CLI not found. Installing AWS CLI v2 into \$HOME..."
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              rm -rf aws aws-cli
               unzip -q awscliv2.zip
-              sudo ./aws/install || ./aws/install
+              ./aws/install --bin-dir "$HOME/bin" --install-dir "$HOME/aws-cli" --update
+            else
+              echo "[SETUP] AWS CLI already installed."
             fi
 
-            echo "[SETUP] Verifying eksctl installation..."
+            echo "[SETUP] Checking eksctl..."
             if ! command -v eksctl >/dev/null 2>&1; then
-              echo "[SETUP] eksctl not found. Installing eksctl..."
+              echo "[SETUP] eksctl not found. Installing eksctl into \$HOME/bin..."
               curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
-                | tar xz -C /tmp
-              sudo mv /tmp/eksctl /usr/local/bin/eksctl || mv /tmp/eksctl /usr/local/bin/eksctl
+                | tar xz -C "$HOME/bin"
+              chmod +x "$HOME/bin/eksctl"
+            else
+              echo "[SETUP] eksctl already installed."
             fi
 
-            echo "[SETUP] aws --version"
+            echo "[SETUP] Checking kubectl..."
+            if ! command -v kubectl >/dev/null 2>&1; then
+              echo "[SETUP] kubectl not found. Installing kubectl into \$HOME/bin..."
+              KUBECTL_VERSION="$(curl -s https://dl.k8s.io/release/stable.txt)"
+              curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+              chmod +x "$HOME/bin/kubectl"
+            else
+              echo "[SETUP] kubectl already installed."
+            fi
+
+            echo "[SETUP] aws version:"
             aws --version || true
 
-            echo "[SETUP] eksctl version"
+            echo "[SETUP] eksctl version:"
             eksctl version || true
 
-            echo "[SETUP] AWS region: ${AWS_REGION}"
+            echo "[SETUP] kubectl version:"
+            kubectl version --client || true
           '''
         }
       }
@@ -74,6 +93,10 @@ pipeline {
           sh '''
             set -e
 
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
             echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION}..."
 
             eksctl create cluster \
@@ -90,8 +113,10 @@ pipeline {
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
 
-            echo "[EKS] Verifying nodes..."
+            echo "[EKS] Updating kubeconfig..."
             aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+
+            echo "[EKS] Verifying nodes..."
             kubectl get nodes -o wide
           '''
         }
@@ -101,11 +126,10 @@ pipeline {
 
   post {
     success {
-      echo "EKS cluster ${env.CLUSTER_NAME} created successfully in ${env.AWS_REGION}."
+      echo "✅ EKS cluster ${env.CLUSTER_NAME} created successfully in ${env.AWS_REGION}."
     }
     failure {
-      echo "EKS cluster creation failed. Check the logs above."
+      echo "❌ EKS cluster creation failed. Check the stage logs above."
     }
   }
 }
-
