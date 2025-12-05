@@ -3,7 +3,7 @@ pipeline {
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'demo-eks-cluster'
+    CLUSTER_NAME    = 'demotest-eks-cluster'
     EKS_VERSION     = '1.33'              // adjust as needed
     NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
