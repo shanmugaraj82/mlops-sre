@@ -4,7 +4,7 @@ pipeline {
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'demoraj-eks-cluster'
+    CLUSTER_NAME    = 'demoraj2-eks-cluster'
     EKS_VERSION     = '1.33'              // adjust as needed / or match your actual EKS version
     NODEGROUP_NAME  = 'ng-default'        // kept for future use (not used with Auto Mode)
     NODE_TYPE       = 't3.small'
