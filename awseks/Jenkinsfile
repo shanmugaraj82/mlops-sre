@@ -108,16 +108,10 @@ pipeline {
             echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION}..."
 
             eksctl create cluster \
-              --name "${CLUSTER_NAME}" \
-              --version "${EKS_VERSION}" \
-              --region "${AWS_REGION}" \
-              --nodegroup-name "${NODEGROUP_NAME}" \
-              --node-type "${NODE_TYPE}" \
-              --nodes "${NODE_COUNT}" \
-              --asg-access \
-              --alb-ingress-access \
-              --full-ecr-access \
-              --enable-auto-mode
+            --name "${CLUSTER_NAME}" \
+            --version "${EKS_VERSION}" \
+            --region "${AWS_REGION}" \
+            --enable-auto-mode
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
 
