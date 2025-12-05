@@ -118,7 +118,7 @@ pipeline {
               --asg-access \
               --alb-ingress-access \
               --full-ecr-access \
-              --auto-mode-config-enabled=true
+              --enable-auto-mode
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
 
