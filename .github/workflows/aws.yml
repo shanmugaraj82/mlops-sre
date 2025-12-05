@@ -180,17 +180,41 @@ jobs:
           # Optional: speed up SSH
           printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" >> ~/.ssh/config
 
-      # --- NEW: Fetch Jenkins initial admin password from the instance ---
+            # --- NEW: Fetch Jenkins initial admin password from the instance ---
       - name: Fetch Jenkins initial admin password
         run: |
           PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
 
-          echo "Waiting 90 seconds for Jenkins to complete initial setup..."
-          sleep 90
+          echo "Waiting for Jenkins to complete initial setup and generate the admin password..."
 
-          echo "Fetching Jenkins initial admin password from ${PUBLIC_DNS}..."
+          # Poll up to ~10 minutes (20 * 30s)
+          for i in {1..20}; do
+            echo "Attempt $i: checking for /var/lib/jenkins/secrets/initialAdminPassword..."
+
+            if ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "test -f /var/lib/jenkins/secrets/initialAdminPassword"; then
+              echo "Password file found. Fetching..."
+
+              ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" \
+                "sudo cat /var/lib/jenkins/secrets/initialAdminPassword" > jenkins_admin_password.txt
+
+              echo "------------------------"
+              echo "Jenkins initial admin password:"
+              cat jenkins_admin_password.txt
+              echo "------------------------"
+
+              exit 0
+            fi
+
+            echo "Not ready yet, waiting 30 seconds..."
+            sleep 30
+          done
+
+          echo "initialAdminPassword file not found after waiting. Dumping Jenkins status and logs..."
+
           ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" \
-            "sudo cat /var/lib/jenkins/secrets/initialAdminPassword" > jenkins_admin_password.txt
+            "sudo systemctl status jenkins --no-pager || true"
 
-          echo "Jenkins initial admin password:"
-          cat jenkins_admin_password.txt
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" \
+            "sudo journalctl -u jenkins --no-pager | tail -n 50 || true"
+
+          exit 1
