@@ -9,7 +9,7 @@ jobs:
 
     env:
       AWS_REGION: us-east-1
-      CLUSTER_NAME: demo3-eks-cluster      # <-- change if your cluster name is different
+      CLUSTER_NAME: demoraj2-eks-cluster      # <-- change if your cluster name is different
       ARGOCD_NAMESPACE: argocd
 
     steps:
