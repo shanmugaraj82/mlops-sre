@@ -9,7 +9,7 @@ jobs:
 
     env:
       AWS_REGION: us-east-1
-      CLUSTER_NAME: demo-eks-cluster      # <-- change if your cluster name is different
+      CLUSTER_NAME: demo3-eks-cluster      # <-- change if your cluster name is different
       ARGOCD_NAMESPACE: argocd
 
     steps:
@@ -90,3 +90,28 @@ jobs:
           echo "For port-forward (local testing), you can run:"
           echo "  kubectl port-forward svc/argocd-server -n ${ARGOCD_NAMESPACE} 8080:443"
           echo "Then open: https://localhost:8080"
+      - name: Expose Argo CD via LoadBalancer
+        run: |
+          export KUBECONFIG="$HOME/.kube/config"
+
+          echo "Patching argocd-server Service to type LoadBalancer..."
+          kubectl patch svc argocd-server -n "${ARGOCD_NAMESPACE}" -p '{
+            "spec": {
+              "type": "LoadBalancer"
+            }
+          }'
+
+          echo "Waiting for LoadBalancer external IP..."
+          for i in {1..30}; do
+            EXTERNAL_IP=$(kubectl get svc argocd-server -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "$EXTERNAL_IP" ]; then
+              echo "Argo CD is available at: https://$EXTERNAL_IP"
+              exit 0
+            fi
+            echo "Still waiting for external IP... ($i/30)"
+            sleep 10
+          done
+
+          echo "Timed out waiting for Argo CD LoadBalancer external IP."
+          kubectl get svc argocd-server -n "${ARGOCD_NAMESPACE}"
+          exit 1
