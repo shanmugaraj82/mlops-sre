@@ -1,11 +1,12 @@
+
 pipeline {
   agent any
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'demotest-eks-cluster'
-    EKS_VERSION     = '1.33'              // adjust as needed
-    NODEGROUP_NAME  = 'ng-default'
+    CLUSTER_NAME    = 'demo3-eks-cluster'
+    EKS_VERSION     = '1.33'              // adjust as needed / or match your actual EKS version
+    NODEGROUP_NAME  = 'ng-default'        // kept for future use (not used with Auto Mode)
     NODE_TYPE       = 't3.small'
     NODE_COUNT      = '2'
   }
@@ -60,11 +61,11 @@ pipeline {
 
             echo "[SETUP] Checking kubectl..."
             if ! command -v kubectl >/dev/null 2>&1; then
-              echo "[SETUP] kubectl not found. Installing kubectl into $HOME/bin..."
+              echo "[SETUP] kubectl not found. Installing pinned kubectl (v1.25.16) into $HOME/bin to avoid ExecCredential issues..."
 
-              # Follow redirects and take only the first line as version
-              KUBECTL_VERSION="$(curl -fsSL -L https://dl.k8s.io/release/stable.txt | head -n 1 | tr -d '\\r')"
-              echo "[SETUP] Detected kubectl version: $KUBECTL_VERSION"
+              # Pin kubectl to a version that still supports ExecCredential v1alpha1
+              KUBECTL_VERSION="v1.25.16"
+              echo "[SETUP] Using kubectl version: $KUBECTL_VERSION"
 
               curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
               chmod +x "$HOME/bin/kubectl"
@@ -85,7 +86,7 @@ pipeline {
       }
     }
 
-    stage('Create EKS Cluster') {
+    stage('Create EKS Cluster (Auto Mode)') {
       steps {
         withCredentials([
           usernamePassword(
@@ -105,13 +106,14 @@ pipeline {
             KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
             export KUBECONFIG="$KUBECONFIG_FILE"
 
-            echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION}..."
+            echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION} with Auto Mode enabled..."
 
+            # With Auto Mode enabled, do NOT pass --nodes / --node-type / --nodegroup-name
             eksctl create cluster \
-            --name "${CLUSTER_NAME}" \
-            --version "${EKS_VERSION}" \
-            --region "${AWS_REGION}" \
-            --enable-auto-mode
+              --name "${CLUSTER_NAME}" \
+              --version "${EKS_VERSION}" \
+              --region "${AWS_REGION}" \
+              --enable-auto-mode
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
 
@@ -122,7 +124,8 @@ pipeline {
               --kubeconfig "${KUBECONFIG_FILE}"
 
             echo "[EKS] Patching kubeconfig exec apiVersion if needed..."
-            # Some AWS auth plugins still write v1alpha1, but kubectl 1.26+ requires v1beta1+
+            # Some AWS auth plugins still emit v1alpha1 ExecCredential; kubectl 1.25 supports it,
+            # but we patch the kubeconfig as a safety net.
             sed -i 's/client.authentication.k8s.io\\/v1alpha1/client.authentication.k8s.io\\/v1beta1/g' "${KUBECONFIG_FILE}" || true
 
             echo "[EKS] Verifying nodes with kubectl..."
