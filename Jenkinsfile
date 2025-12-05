@@ -39,7 +39,7 @@ pipeline {
 
             echo "[SETUP] Checking AWS CLI..."
             if ! command -v aws >/dev/null 2>&1; then
-              echo "[SETUP] AWS CLI not found. Installing AWS CLI v2 into \$HOME..."
+              echo "[SETUP] AWS CLI not found. Installing AWS CLI v2 into $HOME..."
               curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
               rm -rf aws aws-cli
               unzip -q awscliv2.zip
@@ -50,7 +50,7 @@ pipeline {
 
             echo "[SETUP] Checking eksctl..."
             if ! command -v eksctl >/dev/null 2>&1; then
-              echo "[SETUP] eksctl not found. Installing eksctl into \$HOME/bin..."
+              echo "[SETUP] eksctl not found. Installing eksctl into $HOME/bin..."
               curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
                 | tar xz -C "$HOME/bin"
               chmod +x "$HOME/bin/eksctl"
@@ -60,8 +60,12 @@ pipeline {
 
             echo "[SETUP] Checking kubectl..."
             if ! command -v kubectl >/dev/null 2>&1; then
-              echo "[SETUP] kubectl not found. Installing kubectl into \$HOME/bin..."
-              KUBECTL_VERSION="$(curl -s https://dl.k8s.io/release/stable.txt)"
+              echo "[SETUP] kubectl not found. Installing kubectl into $HOME/bin..."
+
+              # Follow redirects and take only the first line as version
+              KUBECTL_VERSION="$(curl -fsSL -L https://dl.k8s.io/release/stable.txt | head -n 1 | tr -d '\\r')"
+              echo "[SETUP] Detected kubectl version: $KUBECTL_VERSION"
+
               curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
               chmod +x "$HOME/bin/kubectl"
             else
