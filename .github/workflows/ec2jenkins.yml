@@ -176,7 +176,7 @@ jobs:
 
           echo "[JENKINS-INSTALL] Installing Java 17 (Amazon Corretto) and dependencies..."
           # Jenkins 2.479.1+ LTS requires Java 17 or 21
-          sudo yum install -y fontconfig java-17-amazon-corretto
+          sudo yum install -y fontconfig java-17-amazon-corretto git
 
           # Detect Java 17 installation directory
           JAVA_DIR=$(ls -d /usr/lib/jvm/java-17-* 2>/dev/null | head -n 1 || true)

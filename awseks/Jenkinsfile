@@ -3,8 +3,8 @@ pipeline {
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'demo-eks-cluster'
-    EKS_VERSION     = '1.29'        // adjust as needed
+    CLUSTER_NAME    = 'demo2-eks-cluster'
+    EKS_VERSION     = '1.33'              // adjust as needed
     NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
     NODE_COUNT      = '2'
