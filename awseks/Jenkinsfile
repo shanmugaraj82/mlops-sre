@@ -3,7 +3,7 @@ pipeline {
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'demo2-eks-cluster'
+    CLUSTER_NAME    = 'demo-eks-cluster'
     EKS_VERSION     = '1.33'              // adjust as needed
     NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
@@ -101,6 +101,10 @@ pipeline {
             export AWS_REGION="${AWS_REGION}"
             export AWS_DEFAULT_REGION="${AWS_REGION}"
 
+            # Use a dedicated kubeconfig file for this build
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
             echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION}..."
 
             eksctl create cluster \
@@ -118,11 +122,18 @@ pipeline {
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
 
-            echo "[EKS] Updating kubeconfig..."
-            aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+            echo "[EKS] Updating kubeconfig at ${KUBECONFIG_FILE}..."
+            aws eks update-kubeconfig \
+              --name "${CLUSTER_NAME}" \
+              --region "${AWS_REGION}" \
+              --kubeconfig "${KUBECONFIG_FILE}"
 
-            echo "[EKS] Verifying nodes..."
-            kubectl get nodes -o wide
+            echo "[EKS] Patching kubeconfig exec apiVersion if needed..."
+            # Some AWS auth plugins still write v1alpha1, but kubectl 1.26+ requires v1beta1+
+            sed -i 's/client.authentication.k8s.io\\/v1alpha1/client.authentication.k8s.io\\/v1beta1/g' "${KUBECONFIG_FILE}" || true
+
+            echo "[EKS] Verifying nodes with kubectl..."
+            kubectl --kubeconfig "${KUBECONFIG_FILE}" get nodes -o wide
           '''
         }
       }
