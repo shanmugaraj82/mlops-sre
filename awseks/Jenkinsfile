@@ -116,20 +116,6 @@ pipeline {
               --enable-auto-mode
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
-
-            echo "[EKS] Updating kubeconfig at ${KUBECONFIG_FILE}..."
-            aws eks update-kubeconfig \
-              --name "${CLUSTER_NAME}" \
-              --region "${AWS_REGION}" \
-              --kubeconfig "${KUBECONFIG_FILE}"
-
-            echo "[EKS] Patching kubeconfig exec apiVersion if needed..."
-            # Some AWS auth plugins still emit v1alpha1 ExecCredential; kubectl 1.25 supports it,
-            # but we patch the kubeconfig as a safety net.
-            sed -i 's/client.authentication.k8s.io\\/v1alpha1/client.authentication.k8s.io\\/v1beta1/g' "${KUBECONFIG_FILE}" || true
-
-            echo "[EKS] Verifying nodes with kubectl..."
-            kubectl --kubeconfig "${KUBECONFIG_FILE}" get nodes -o wide
           '''
         }
       }
