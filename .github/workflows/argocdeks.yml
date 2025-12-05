@@ -1,0 +1,92 @@
+name: Install Argo CD on EKS
+
+on:
+  workflow_dispatch: {}   # Run manually from GitHub Actions UI
+
+jobs:
+  install-argocd:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      CLUSTER_NAME: demo-eks-cluster      # <-- change if your cluster name is different
+      ARGOCD_NAMESPACE: argocd
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="$(curl -fsSL -L https://dl.k8s.io/release/stable.txt | head -n 1 | tr -d '\r')"
+          echo "Using kubectl version: $KUBECTL_VERSION"
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Update kubeconfig for EKS cluster
+        run: |
+          echo "Updating kubeconfig for cluster ${CLUSTER_NAME} in region ${AWS_REGION}..."
+          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+          echo "Current context:"
+          kubectl config current-context
+          echo "Listing cluster nodes (sanity check):"
+          kubectl get nodes -o wide
+
+      - name: Create Argo CD namespace (if not exists)
+        run: |
+          if ! kubectl get namespace "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Creating namespace ${ARGOCD_NAMESPACE}..."
+            kubectl create namespace "${ARGOCD_NAMESPACE}"
+          else
+            echo "Namespace ${ARGOCD_NAMESPACE} already exists."
+          fi
+
+      - name: Install / Upgrade Argo CD
+        run: |
+          echo "Applying Argo CD install manifest in namespace ${ARGOCD_NAMESPACE}..."
+          # Official Argo CD install manifest
+          kubectl apply -n "${ARGOCD_NAMESPACE}" -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+          echo "Waiting for Argo CD pods to be ready..."
+          kubectl rollout status deployment/argocd-server -n "${ARGOCD_NAMESPACE}" --timeout=600s
+          kubectl get pods -n "${ARGOCD_NAMESPACE}"
+
+      - name: Get Argo CD initial admin password
+        run: |
+          echo "Fetching Argo CD initial admin password..."
+          # Default: secret 'argocd-initial-admin-secret' in the Argo CD namespace
+          kubectl -n "${ARGOCD_NAMESPACE}" get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d > argocd_admin_password.txt || true
+
+          if [ -s argocd_admin_password.txt ]; then
+            echo "------------------------"
+            echo "Argo CD admin username: admin"
+            echo -n "Argo CD admin password: "
+            cat argocd_admin_password.txt
+            echo
+            echo "------------------------"
+          else
+            echo "Could not find argocd-initial-admin-secret or password was empty."
+            echo "Listing secrets in namespace ${ARGOCD_NAMESPACE} for debugging:"
+            kubectl -n "${ARGOCD_NAMESPACE}" get secrets
+            exit 1
+          fi
+
+      - name: Print Argo CD access info
+        run: |
+          echo "Argo CD installed in namespace: ${ARGOCD_NAMESPACE}"
+          echo
+          echo "If using NodePort or LoadBalancer, expose the argocd-server service, e.g.:"
+          echo "  kubectl -n ${ARGOCD_NAMESPACE} get svc argocd-server"
+          echo
+          echo "For port-forward (local testing), you can run:"
+          echo "  kubectl port-forward svc/argocd-server -n ${ARGOCD_NAMESPACE} 8080:443"
+          echo "Then open: https://localhost:8080"
