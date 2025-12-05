@@ -114,7 +114,6 @@ pipeline {
               --nodegroup-name "${NODEGROUP_NAME}" \
               --node-type "${NODE_TYPE}" \
               --nodes "${NODE_COUNT}" \
-              --managed \
               --asg-access \
               --alb-ingress-access \
               --full-ecr-access \
