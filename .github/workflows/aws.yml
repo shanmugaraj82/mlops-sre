@@ -1,94 +1,196 @@
-# This workflow will build and push a new container image to Amazon ECR,
-# and then will deploy a new task definition to Amazon ECS, when there is a push to the "main" branch.
-#
-# To use this workflow, you will need to complete the following set-up steps:
-#
-# 1. Create an ECR repository to store your images.
-#    For example: `aws ecr create-repository --repository-name my-ecr-repo --region us-east-2`.
-#    Replace the value of the `ECR_REPOSITORY` environment variable in the workflow below with your repository's name.
-#    Replace the value of the `AWS_REGION` environment variable in the workflow below with your repository's region.
-#
-# 2. Create an ECS task definition, an ECS cluster, and an ECS service.
-#    For example, follow the Getting Started guide on the ECS console:
-#      https://us-east-2.console.aws.amazon.com/ecs/home?region=us-east-2#/firstRun
-#    Replace the value of the `ECS_SERVICE` environment variable in the workflow below with the name you set for the Amazon ECS service.
-#    Replace the value of the `ECS_CLUSTER` environment variable in the workflow below with the name you set for the cluster.
-#
-# 3. Store your ECS task definition as a JSON file in your repository.
-#    The format should follow the output of `aws ecs register-task-definition --generate-cli-skeleton`.
-#    Replace the value of the `ECS_TASK_DEFINITION` environment variable in the workflow below with the path to the JSON file.
-#    Replace the value of the `CONTAINER_NAME` environment variable in the workflow below with the name of the container
-#    in the `containerDefinitions` section of the task definition.
-#
-# 4. Store an IAM user access key in GitHub Actions secrets named `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
-#    See the documentation for each action used below for the recommended IAM policies for this IAM user,
-#    and best practices on handling the access key credentials.
-
-name: Deploy to Amazon ECS
+name: Deploy Jenkins EC2
 
 on:
-  push:
-    branches: [ "main" ]
-
-env:
-  AWS_REGION: MY_AWS_REGION                   # set this to your preferred AWS region, e.g. us-west-1
-  ECR_REPOSITORY: MY_ECR_REPOSITORY           # set this to your Amazon ECR repository name
-  ECS_SERVICE: MY_ECS_SERVICE                 # set this to your Amazon ECS service name
-  ECS_CLUSTER: MY_ECS_CLUSTER                 # set this to your Amazon ECS cluster name
-  ECS_TASK_DEFINITION: MY_ECS_TASK_DEFINITION # set this to the path to your Amazon ECS task definition
-                                               # file, e.g. .aws/task-definition.json
-  CONTAINER_NAME: MY_CONTAINER_NAME           # set this to the name of the container in the
-                                               # containerDefinitions section of your task definition
-
-permissions:
-  contents: read
+  workflow_dispatch: {}   # Run manually from GitHub Actions UI
 
 jobs:
-  deploy:
-    name: Deploy
+  deploy-jenkins-ec2:
     runs-on: ubuntu-latest
-    environment: production
+
+    env:
+      AWS_REGION: us-east-1
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      # Configure AWS using GitHub Secrets (writes to ~/.aws/credentials)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      - name: Create user-data script for Jenkins
+        run: |
+          cat > user-data.sh << 'EOF'
+          #!/bin/bash
+          # Update system
+          yum update -y
 
-    - name: Build, tag, and push image to Amazon ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        # Build a docker container and
-        # push it to ECR so that it can
-        # be deployed to ECS.
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          # Install Java (required by Jenkins)
+          amazon-linux-extras install java-openjdk11 -y || yum install -y java-11-openjdk
 
-    - name: Fill in the new image ID in the Amazon ECS task definition
-      id: task-def
-      uses: aws-actions/amazon-ecs-render-task-definition@v1
-      with:
-        task-definition: ${{ env.ECS_TASK_DEFINITION }}
-        container-name: ${{ env.CONTAINER_NAME }}
-        image: ${{ steps.build-image.outputs.image }}
+          # Add Jenkins repo and key
+          curl -fsSL https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key | sudo tee \
+            /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins.io-2023 >/dev/null
 
-    - name: Deploy Amazon ECS task definition
-      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-      with:
-        task-definition: ${{ steps.task-def.outputs.task-definition }}
-        service: ${{ env.ECS_SERVICE }}
-        cluster: ${{ env.ECS_CLUSTER }}
-        wait-for-service-stability: true
+          cat > /etc/yum.repos.d/jenkins.repo << 'EOR'
+          [jenkins]
+          name=Jenkins-stable
+          baseurl=https://pkg.jenkins.io/redhat-stable
+          gpgcheck=1
+          gpgkey=https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+          EOR
+
+          # Install Jenkins
+          yum install -y jenkins
+
+          # Enable and start Jenkins
+          systemctl enable jenkins
+          systemctl start jenkins
+
+          # Optional: open firewall for port 8080 if firewalld is present
+          if command -v firewall-cmd &> /dev/null; then
+            firewall-cmd --permanent --add-port=8080/tcp || true
+            firewall-cmd --reload || true
+          fi
+          EOF
+
+      - name: Find default VPC
+        id: vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" \
+            --output text)
+
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "No default VPC found in region ${AWS_REGION}"
+            exit 1
+          fi
+
+          echo "Default VPC: ${VPC_ID}"
+          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Create security group for Jenkins (if needed)
+        id: sg
+        run: |
+          SG_NAME="jenkins-sg"
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+
+          # Check if SG exists
+          EXISTING_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text 2>/dev/null || true)
+
+          if [ "$EXISTING_SG_ID" = "None" ] || [ -z "$EXISTING_SG_ID" ]; then
+            echo "Creating new security group ${SG_NAME} in VPC ${VPC_ID}"
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "${SG_NAME}" \
+              --description "Security group for Jenkins server" \
+              --vpc-id "${VPC_ID}" \
+              --query "GroupId" \
+              --output text)
+
+            # Allow SSH (22) and Jenkins (8080) from anywhere (tighten this in real use)
+            aws ec2 authorize-security-group-ingress \
+              --group-id "${SG_ID}" \
+              --ip-permissions '[
+                {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+              ]'
+          else
+            echo "Using existing security group ${EXISTING_SG_ID}"
+            SG_ID="${EXISTING_SG_ID}"
+          fi
+
+          echo "sg_id=${SG_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Find a default subnet in the default VPC
+        id: subnet
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=default-for-az,Values=true" \
+            --query "Subnets[0].SubnetId" \
+            --output text)
+
+          if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+            echo "No default subnet found in default VPC ${VPC_ID}"
+            exit 1
+          fi
+
+          echo "Using default subnet: ${SUBNET_ID}"
+          echo "subnet_id=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Launch EC2 instance for Jenkins
+        id: ec2
+        run: |
+          # Amazon Linux 2 AMI for us-east-1 (x86_64)
+          AMI_ID="ami-0c02fb55956c7d316"
+
+          INSTANCE_TYPE="t3.small"
+          SUBNET_ID="${{ steps.subnet.outputs.subnet_id }}"
+          SG_ID="${{ steps.sg.outputs.sg_id }}"
+          KEY_NAME="${{ secrets.EC2_KEY_PAIR_NAME }}"
+
+          echo "Launching EC2 instance in subnet ${SUBNET_ID} with SG ${SG_ID} and key pair ${KEY_NAME}..."
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${AMI_ID}" \
+            --instance-type "${INSTANCE_TYPE}" \
+            --subnet-id "${SUBNET_ID}" \
+            --security-group-ids "${SG_ID}" \
+            --associate-public-ip-address \
+            --key-name "${KEY_NAME}" \
+            --user-data file://user-data.sh \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=jenkins-server}]' \
+            --query "Instances[0].InstanceId" \
+            --output text)
+
+          echo "Created instance: ${INSTANCE_ID}"
+
+          # Wait until instance is running
+          aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+
+          # Get public DNS
+          PUBLIC_DNS=$(aws ec2 describe-instances \
+            --instance-ids "${INSTANCE_ID}" \
+            --query "Reservations[0].Instances[0].PublicDnsName" \
+            --output text)
+
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "public_dns=${PUBLIC_DNS}" >> "$GITHUB_OUTPUT"
+
+      - name: Output Jenkins URL
+        run: |
+          echo "EC2 Instance ID: ${{ steps.ec2.outputs.instance_id }}"
+          echo "Jenkins should be accessible (after Jenkins finishes starting) at:"
+          echo "  http://${{ steps.ec2.outputs.public_dns }}:8080"
+
+      # --- NEW: Setup SSH key on the runner ---
+      - name: Setup SSH key for EC2 access
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/jenkins-ec2-key
+          chmod 600 ~/.ssh/jenkins-ec2-key
+          # Optional: speed up SSH
+          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" >> ~/.ssh/config
+
+      # --- NEW: Fetch Jenkins initial admin password from the instance ---
+      - name: Fetch Jenkins initial admin password
+        run: |
+          PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
+
+          echo "Waiting 90 seconds for Jenkins to complete initial setup..."
+          sleep 90
+
+          echo "Fetching Jenkins initial admin password from ${PUBLIC_DNS}..."
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" \
+            "sudo cat /var/lib/jenkins/secrets/initialAdminPassword" > jenkins_admin_password.txt
+
+          echo "Jenkins initial admin password:"
+          cat jenkins_admin_password.txt
