@@ -90,6 +90,75 @@ jobs:
           echo "Using default subnet: ${SUBNET_ID}"
           echo "subnet_id=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
 
+      - name: Launch EC2 instance for Jenkins
+        id: ec2
+        run: |
+          # Amazon Linux 2 AMI for us-east-1 (x86_64)
+          AMI_ID="ami-0c02fb55956c7d316"
+
+          INSTANCE_TYPE="t3.micro"
+          SUBNET_ID="${{ steps.subnet.outputs.subnet_id }}"
+          SG_ID="${{ steps.sg.outputs.sg_id }}"
+          KEY_NAME="${{ secrets.EC2_KEY_PAIR_NAME }}"
+
+          echo "Launching EC2 instance in subnet ${SUBNET_ID} with SG ${SG_ID} and key pair ${KEY_NAME}..."
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${AMI_ID}" \
+            --instance-type "${INSTANCE_TYPE}" \
+            --subnet-id "${SUBNET_ID}" \
+            --security-group-ids "${SG_ID}" \
+            --associate-public-ip-address \
+            --key-name "${KEY_NAME}" \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=jenkins-server}]' \
+            --query "Instances[0].InstanceId" \
+            --output text)
+
+          echo "Created instance: ${INSTANCE_ID}"
+
+          # Wait until instance is running
+          aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+
+          # Get public DNS
+          PUBLIC_DNS=$(aws ec2 describe-instances \
+            --instance-ids "${INSTANCE_ID}" \
+            --query "Reservations[0].Instances[0].PublicDnsName" \
+            --output text)
+
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "public_dns=${PUBLIC_DNS}" >> "$GITHUB_OUTPUT"
+
+      - name: Output instance info
+        run: |
+          echo "EC2 Instance ID: ${{ steps.ec2.outputs.instance_id }}"
+          echo "Public DNS: ${{ steps.ec2.outputs.public_dns }}"
+
+      # Setup SSH key on the runner
+      - name: Setup SSH key for EC2 access
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/jenkins-ec2-key
+          chmod 600 ~/.ssh/jenkins-ec2-key
+          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" >> ~/.ssh/config
+
+      - name: Wait for SSH (port 22) to be reachable
+        run: |
+          PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
+          echo "Waiting for SSH on ${PUBLIC_DNS}:22..."
+
+          for i in {1..30}; do
+            echo "Attempt $i: checking SSH..."
+            if timeout 5 bash -c "echo >/dev/tcp/${PUBLIC_DNS}/22" 2>/dev/null; then
+              echo "SSH is reachable."
+              exit 0
+            fi
+            echo "SSH not ready yet, sleeping 10 seconds..."
+            sleep 10
+          done
+
+          echo "SSH not reachable after multiple attempts."
+          exit 1
+
       - name: Install Jenkins on EC2 via SSH
         run: |
           PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
@@ -134,77 +203,6 @@ jobs:
           sudo systemctl enable jenkins
 
           echo "[JENKINS-INSTALL] Jenkins service started successfully."
-          EOF
-
-      - name: Output instance info
-        run: |
-          echo "EC2 Instance ID: ${{ steps.ec2.outputs.instance_id }}"
-          echo "Public DNS: ${{ steps.ec2.outputs.public_dns }}"
-
-      # Setup SSH key on the runner
-      - name: Setup SSH key for EC2 access
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/jenkins-ec2-key
-          chmod 600 ~/.ssh/jenkins-ec2-key
-          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" >> ~/.ssh/config
-
-      - name: Wait for SSH (port 22) to be reachable
-        run: |
-          PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
-          echo "Waiting for SSH on ${PUBLIC_DNS}:22..."
-
-          for i in {1..30}; do
-            echo "Attempt $i: checking SSH..."
-            if timeout 5 bash -c "echo >/dev/tcp/${PUBLIC_DNS}/22" 2>/dev/null; then
-              echo "SSH is reachable."
-              exit 0
-            fi
-            echo "SSH not ready yet, sleeping 10 seconds..."
-            sleep 10
-          done
-
-          echo "SSH not reachable after multiple attempts."
-          exit 1
-
-      - name: Install Jenkins on EC2 via SSH
-        run: |
-          PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
-
-          echo "Installing Jenkins on ${PUBLIC_DNS} via SSH..."
-          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" << 'EOF'
-          set -e
-
-          # Update system
-          sudo yum update -y
-
-          # Install Java (required by Jenkins)
-          sudo amazon-linux-extras install java-openjdk11 -y || sudo yum install -y java-11-openjdk
-
-          # Add Jenkins repo and key
-          curl -fsSL https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key | sudo tee \
-            /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins.io-2023 >/dev/null
-
-          sudo bash -c 'cat > /etc/yum.repos.d/jenkins.repo << "EOR"
-          [jenkins]
-          name=Jenkins-stable
-          baseurl=https://pkg.jenkins.io/redhat-stable
-          gpgcheck=1
-          gpgkey=https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
-          EOR'
-
-          # Install Jenkins
-          sudo yum install -y jenkins
-
-          # Enable and start Jenkins
-          sudo systemctl enable jenkins
-          sudo systemctl start jenkins
-
-          # Optional: open firewall for port 8080 if firewalld is present
-          if command -v firewall-cmd &> /dev/null; then
-            sudo firewall-cmd --permanent --add-port=8080/tcp || true
-            sudo firewall-cmd --reload || true
-          fi
           EOF
 
       - name: Output Jenkins URL
