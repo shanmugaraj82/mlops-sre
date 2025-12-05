@@ -90,46 +90,51 @@ jobs:
           echo "Using default subnet: ${SUBNET_ID}"
           echo "subnet_id=${SUBNET_ID}" >> "$GITHUB_OUTPUT"
 
-      - name: Launch EC2 instance for Jenkins
-        id: ec2
+      - name: Install Jenkins on EC2 via SSH
         run: |
-          # Amazon Linux 2 AMI for us-east-1 (x86_64)
-          AMI_ID="ami-0c02fb55956c7d316"
+          PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
 
-          INSTANCE_TYPE="t3.small"
-          SUBNET_ID="${{ steps.subnet.outputs.subnet_id }}"
-          SG_ID="${{ steps.sg.outputs.sg_id }}"
-          KEY_NAME="${{ secrets.EC2_KEY_PAIR_NAME }}"
+          echo "Installing Jenkins on ${PUBLIC_DNS} via SSH..."
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" << 'EOF'
+          set -e
 
-          echo "Launching EC2 instance in subnet ${SUBNET_ID} with SG ${SG_ID} and key pair ${KEY_NAME}..."
+          echo "[JENKINS-INSTALL] Updating system..."
+          sudo yum update -y
 
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id "${AMI_ID}" \
-            --instance-type "${INSTANCE_TYPE}" \
-            --subnet-id "${SUBNET_ID}" \
-            --security-group-ids "${SG_ID}" \
-            --associate-public-ip-address \
-            --key-name "${KEY_NAME}" \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=jenkins-server}]' \
-            --query "Instances[0].InstanceId" \
-            --output text)
+          echo "[JENKINS-INSTALL] Installing Java 11 and dependencies..."
+          # Jenkins on RedHat-like systems expects fontconfig + Java 11
+          sudo yum install -y fontconfig java-11-openjdk
 
-          echo "Created instance: ${INSTANCE_ID}"
+          echo "[JENKINS-INSTALL] Adding Jenkins repo and key..."
+          sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
 
-          # Wait until instance is running
-          aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+          sudo bash -c 'cat > /etc/yum.repos.d/jenkins.repo << "EOR"
+          [jenkins]
+          name=Jenkins-stable
+          baseurl=https://pkg.jenkins.io/redhat-stable
+          gpgcheck=1
+          gpgkey=https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+          EOR'
 
-          # Get public DNS
-          PUBLIC_DNS=$(aws ec2 describe-instances \
-            --instance-ids "${INSTANCE_ID}" \
-            --query "Reservations[0].Instances[0].PublicDnsName" \
-            --output text)
+          echo "[JENKINS-INSTALL] Installing Jenkins..."
+          sudo yum install -y jenkins
 
-          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
-          echo "public_dns=${PUBLIC_DNS}" >> "$GITHUB_OUTPUT"
+          echo "[JENKINS-INSTALL] Reloading systemd daemon..."
+          sudo systemctl daemon-reload
 
+          echo "[JENKINS-INSTALL] Starting Jenkins service..."
+          if ! sudo systemctl start jenkins; then
+            echo "[JENKINS-INSTALL] Jenkins failed to start. Dumping status and last 50 log lines:"
+            sudo systemctl status jenkins --no-pager || true
+            sudo journalctl -u jenkins --no-pager | tail -n 50 || true
+            exit 1
+          fi
 
+          echo "[JENKINS-INSTALL] Enabling Jenkins at boot..."
+          sudo systemctl enable jenkins
 
+          echo "[JENKINS-INSTALL] Jenkins service started successfully."
+          EOF
 
       - name: Output instance info
         run: |
