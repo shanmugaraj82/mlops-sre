@@ -170,17 +170,40 @@ jobs:
           echo "Argo CD admin username: admin"
           echo -n "Argo CD admin password (stored in argocd_admin_password.txt, hidden here)."
 
-      - name: Login to Argo CD
+      # NEW: Port-forward based access instead of using ELB DNS
+
+      - name: Start port-forward to Argo CD
         env:
-          ARGOCD_SERVER_HOST: ${{ steps.argocd-lb.outputs.hostname }}
+          ARGOCD_NAMESPACE: ${{ env.ARGOCD_NAMESPACE }}
         run: |
-          if [ -z "${ARGOCD_SERVER_HOST}" ]; then
-            echo "ARGOCD_SERVER_HOST not set. Check 'Expose Argo CD via LoadBalancer' step."
+          echo "Starting kubectl port-forward to Argo CD server..."
+          kubectl port-forward svc/argocd-server -n "${ARGOCD_NAMESPACE}" 8443:443 >/tmp/argocd-port-forward.log 2>&1 &
+          echo $! > /tmp/argocd-pf.pid
+
+          echo "Waiting for Argo CD API to become reachable on https://localhost:8443..."
+          for i in {1..30}; do
+            if curl -k --silent --fail https://localhost:8443 >/dev/null 2>&1; then
+              echo "Argo CD API is reachable."
+              exit 0
+            fi
+            echo "Still waiting for Argo CD API... ($i/30)"
+            sleep 5
+          done
+
+          echo "Timed out waiting for Argo CD API via port-forward."
+          echo "Port-forward logs:"
+          cat /tmp/argocd-port-forward.log || true
+          exit 1
+
+      - name: Login to Argo CD via localhost
+        run: |
+          if [ ! -f argocd_admin_password.txt ]; then
+            echo "argocd_admin_password.txt not found. Make sure password step succeeded."
             exit 1
           fi
 
-          echo "Logging into Argo CD at ${ARGOCD_SERVER_HOST}..."
-          argocd login "${ARGOCD_SERVER_HOST}" \
+          echo "Logging into Argo CD at https://localhost:8443 ..."
+          argocd login localhost:8443 \
             --username admin \
             --password "$(cat argocd_admin_password.txt)" \
             --insecure
@@ -268,6 +291,15 @@ jobs:
 
           echo "Triggering initial sync for ${ARGOCD_APP_NAME}..."
           argocd app sync "${ARGOCD_APP_NAME}"
+
+      - name: Stop port-forward
+        if: always()
+        run: |
+          if [ -f /tmp/argocd-pf.pid ]; then
+            PF_PID=$(cat /tmp/argocd-pf.pid)
+            echo "Stopping port-forward process ${PF_PID}..."
+            kill "$PF_PID" || true
+          fi
 
       - name: Final message
         run: |
