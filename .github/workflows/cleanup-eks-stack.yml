@@ -1,0 +1,89 @@
+name: Cleanup EKS Cluster (CloudFormation)
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack_name:
+        description: "CloudFormation stack name that created the EKS cluster"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region where the stack exists"
+        required: true
+        type: string
+        default: "us-east-1"
+
+jobs:
+  delete-eks-stack:
+    runs-on: ubuntu-latest
+
+    env:
+      STACK_NAME: ${{ github.event.inputs.stack_name }}
+      AWS_REGION: ${{ github.event.inputs.aws_region }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Show stack details (pre-check)
+        run: |
+          echo "Checking CloudFormation stack: ${STACK_NAME} in region ${AWS_REGION}"
+          if ! aws cloudformation describe-stacks --stack-name "${STACK_NAME}" >/dev/null 2>&1; then
+            echo "Stack ${STACK_NAME} does not exist or is not accessible."
+            exit 1
+          fi
+
+          echo "Current stack status:"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].{StackName:StackName,Status:StackStatus,CreationTime:CreationTime}" \
+            --output table
+
+          echo
+          echo "Top-level resources in the stack (truncated):"
+          aws cloudformation list-stack-resources \
+            --stack-name "${STACK_NAME}" \
+            --output table | head -n 50 || true
+
+      - name: Initiate CloudFormation stack delete
+        run: |
+          echo "Deleting CloudFormation stack: ${STACK_NAME} in region ${AWS_REGION}..."
+          aws cloudformation delete-stack \
+            --stack-name "${STACK_NAME}" \
+            --region "${AWS_REGION}"
+
+          echo "Delete request submitted. Waiting for stack deletion to complete..."
+
+      - name: Wait for stack delete to complete
+        run: |
+          set -e
+          if aws cloudformation wait stack-delete-complete \
+               --stack-name "${STACK_NAME}" \
+               --region "${AWS_REGION}"; then
+            echo "Stack ${STACK_NAME} has been deleted successfully."
+          else
+            echo "Stack deletion did not complete successfully. Fetching last events for debugging..."
+            aws cloudformation describe-stack-events \
+              --stack-name "${STACK_NAME}" \
+              --max-items 20 \
+              --output table || true
+
+            echo "Describe current stacks to see if it still exists:"
+            aws cloudformation describe-stacks \
+              --stack-name "${STACK_NAME}" \
+              --output table || true
+
+            exit 1
+          fi
+
+      - name: Final message
+        run: |
+          echo "Cleanup complete."
+          echo "If the stack managed your EKS cluster, the cluster and its managed resources should now be deleted."

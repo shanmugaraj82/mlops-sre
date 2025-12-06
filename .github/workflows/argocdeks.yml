@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}   # Run manually from GitHub Actions UI
 
 jobs:
-  install-argocd:
+  install-argocd-ekscluster:
     runs-on: ubuntu-latest
 
     env:
@@ -30,7 +30,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install kubectl
+      - name: Install kubectl on runner
         run: |
           KUBECTL_VERSION="$(curl -fsSL -L https://dl.k8s.io/release/stable.txt | head -n 1 | tr -d '\r')"
           echo "Using kubectl version: $KUBECTL_VERSION"
@@ -57,7 +57,7 @@ jobs:
             echo "Namespace ${ARGOCD_NAMESPACE} already exists."
           fi
 
-      - name: Install / Upgrade Argo CD
+      - name: Install / Upgrade Argo CD if not exist.
         run: |
           echo "Applying Argo CD install manifest in namespace ${ARGOCD_NAMESPACE}..."
           # Official Argo CD install manifest
