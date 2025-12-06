@@ -1,0 +1,100 @@
+name: Cleanup EKS Cluster with eksctl
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "EKS cluster name to delete"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region where the EKS cluster exists"
+        required: true
+        type: string
+        default: "us-east-1"
+
+jobs:
+  delete-eks-cluster:
+    runs-on: ubuntu-latest
+
+    env:
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+      AWS_REGION: ${{ github.event.inputs.aws_region }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          echo "Installing eksctl..."
+          curl --location "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin/eksctl
+          eksctl version
+
+      - name: Normalize cluster name (trim spaces)
+        run: |
+          echo "Raw cluster name input: '${CLUSTER_NAME}'"
+          CLEAN_NAME=$(echo "${CLUSTER_NAME}" | xargs)
+          echo "Trimmed cluster name: '${CLEAN_NAME}'"
+
+          if ! printf '%s\n' "${CLEAN_NAME}" | grep -Eq '^[0-9A-Za-z][A-Za-z0-9_-]*$'; then
+            echo "ERROR: Trimmed cluster name '${CLEAN_NAME}' is invalid."
+            echo "It must match: ^[0-9A-Za-z][A-Za-z0-9_-]*$"
+            exit 1
+          fi
+
+          echo "CLUSTER_NAME_TRIMMED=${CLEAN_NAME}" >> "$GITHUB_ENV"
+
+      - name: Pre-check EKS cluster
+        run: |
+          echo "Using cluster name: '${CLUSTER_NAME_TRIMMED}' in region '${AWS_REGION}'"
+          echo "Checking if EKS cluster exists..."
+          if ! aws eks describe-cluster --name "${CLUSTER_NAME_TRIMMED}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "EKS cluster '${CLUSTER_NAME_TRIMMED}' not found in region '${AWS_REGION}'. Nothing to delete."
+            exit 0
+          fi
+
+          echo "Cluster found. Details:"
+          aws eks describe-cluster \
+            --name "${CLUSTER_NAME_TRIMMED}" \
+            --region "${AWS_REGION}" \
+            --query "cluster.{Name:name,Status:status,Version:version,Endpoint:endpoint}" \
+            --output table
+
+      - name: Delete EKS cluster with eksctl
+        run: |
+          echo "Deleting EKS cluster '${CLUSTER_NAME_TRIMMED}' in region '${AWS_REGION}' using eksctl..."
+          eksctl delete cluster \
+            --name "${CLUSTER_NAME_TRIMMED}" \
+            --region "${AWS_REGION}" \
+            --wait
+
+          echo "eksctl delete cluster command completed."
+
+      - name: Verify cluster deletion
+        run: |
+          echo "Verifying that EKS cluster '${CLUSTER_NAME_TRIMMED}' has been deleted..."
+          if aws eks describe-cluster --name "${CLUSTER_NAME_TRIMMED}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "Cluster still appears to exist. Describe output:"
+            aws eks describe-cluster \
+              --name "${CLUSTER_NAME_TRIMMED}" \
+              --region "${AWS_REGION}" \
+              --output table || true
+            exit 1
+          else
+            echo "Cluster '${CLUSTER_NAME_TRIMMED}' no longer exists in region '${AWS_REGION}'."
+          fi
+
+      - name: Final message
+        run: |
+          echo "Cleanup complete."
+          echo "EKS cluster '${CLUSTER_NAME_TRIMMED}' and its eksctl-managed resources should now be deleted."
