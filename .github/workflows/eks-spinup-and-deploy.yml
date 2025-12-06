@@ -1,0 +1,277 @@
+name: EKS Spin-up + ArgoCD + App Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "EKS cluster name to create"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: true
+        type: string
+        default: "us-east-1"
+      argocd_app_repo_url:
+        description: "Git repo Argo CD should watch (e.g. https://github.com/ORG/argocd-app.git)"
+        required: true
+        type: string
+      argocd_app_name:
+        description: "Argo CD Application name"
+        required: true
+        type: string
+        default: "nginx-web-app"
+
+jobs:
+  spinup-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+      AWS_REGION: ${{ github.event.inputs.aws_region }}
+      ARGOCD_NAMESPACE: argocd
+
+      # ArgoCD app config
+      ARGOCD_APP_REPO_URL: ${{ github.event.inputs.argocd_app_repo_url }}
+      ARGOCD_APP_NAME: ${{ github.event.inputs.argocd_app_name }}
+      ARGOCD_APP_PATH: manifests          # manifests folder inside repo
+      ARGOCD_APP_DEST_NAMESPACE: default  # where your app (nginx) will be deployed
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          echo "Installing eksctl..."
+          curl --location "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+            | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin/eksctl
+          eksctl version
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="$(curl -fsSL -L https://dl.k8s.io/release/stable.txt | head -n 1 | tr -d '\r')"
+          echo "Using kubectl version: $KUBECTL_VERSION"
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Install ArgoCD CLI
+        run: |
+          ARGOCD_VERSION="v2.13.0"
+          echo "Installing Argo CD CLI ${ARGOCD_VERSION}..."
+          curl -sSL -o argocd "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Normalize cluster name (trim spaces)
+        run: |
+          echo "Raw cluster name input: '${CLUSTER_NAME}'"
+          CLEAN_NAME=$(echo "${CLUSTER_NAME}" | xargs)
+          echo "Trimmed cluster name: '${CLEAN_NAME}'"
+
+          if ! printf '%s\n' "${CLEAN_NAME}" | grep -Eq '^[0-9A-Za-z][A-Za-z0-9_-]*$'; then
+            echo "ERROR: Trimmed cluster name '${CLEAN_NAME}' is invalid."
+            echo "It must match: ^[0-9A-Za-z][A-Za-z0-9_-]*$"
+            exit 1
+          fi
+
+          echo "CLUSTER_NAME_TRIMMED=${CLEAN_NAME}" >> "$GITHUB_ENV"
+
+      - name: Create EKS cluster with eksctl
+        run: |
+          echo "Creating EKS cluster '${CLUSTER_NAME_TRIMMED}' in region '${AWS_REGION}'..."
+          eksctl create cluster \
+            --name "${CLUSTER_NAME_TRIMMED}" \
+            --region "${AWS_REGION}" \
+            --with-oidc \
+            --managed \
+            --nodes 2 \
+            --node-type t3.medium \
+            --nodes-min 2 \
+            --nodes-max 4 \
+            --asg-access
+
+          echo "Cluster created."
+
+      - name: Update kubeconfig & sanity check
+        run: |
+          echo "Updating kubeconfig for cluster ${CLUSTER_NAME_TRIMMED} in region ${AWS_REGION}..."
+          aws eks update-kubeconfig --name "${CLUSTER_NAME_TRIMMED}" --region "${AWS_REGION}"
+          kubectl config current-context
+          echo "Cluster nodes:"
+          kubectl get nodes -o wide
+
+      - name: Create Argo CD namespace (if not exists)
+        run: |
+          if ! kubectl get namespace "${ARGOCD_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Creating namespace ${ARGOCD_NAMESPACE}..."
+            kubectl create namespace "${ARGOCD_NAMESPACE}"
+          else
+            echo "Namespace ${ARGOCD_NAMESPACE} already exists."
+          fi
+
+      - name: Install / Upgrade Argo CD
+        run: |
+          echo "Applying Argo CD install manifest in namespace ${ARGOCD_NAMESPACE}..."
+          kubectl apply -n "${ARGOCD_NAMESPACE}" -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+          echo "Waiting for Argo CD server deployment to be ready..."
+          kubectl rollout status deployment/argocd-server -n "${ARGOCD_NAMESPACE}" --timeout=600s
+          kubectl get pods -n "${ARGOCD_NAMESPACE}"
+
+      - name: Expose Argo CD via LoadBalancer
+        id: argocd-lb
+        run: |
+          echo "Patching argocd-server Service to type LoadBalancer..."
+          kubectl patch svc argocd-server -n "${ARGOCD_NAMESPACE}" -p '{
+            "spec": {
+              "type": "LoadBalancer"
+            }
+          }'
+
+          echo "Waiting for Argo CD LoadBalancer hostname..."
+          for i in {1..30}; do
+            HOST=$(kubectl get svc argocd-server -n "${ARGOCD_NAMESPACE}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "$HOST" ]; then
+              echo "Found Argo CD hostname: $HOST"
+              echo "hostname=$HOST" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Still waiting for external hostname... ($i/30)"
+            sleep 10
+          done
+
+          echo "Timed out waiting for Argo CD LoadBalancer external hostname."
+          kubectl get svc argocd-server -n "${ARGOCD_NAMESPACE}"
+          exit 1
+
+      - name: Get Argo CD initial admin password
+        run: |
+          echo "Fetching Argo CD initial admin password..."
+          kubectl -n "${ARGOCD_NAMESPACE}" get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d > argocd_admin_password.txt || true
+
+          if [ ! -s argocd_admin_password.txt ]; then
+            echo "Failed to get argocd-initial-admin-secret."
+            kubectl -n "${ARGOCD_NAMESPACE}" get secrets
+            exit 1
+          fi
+
+          echo "Argo CD admin username: admin"
+          echo -n "Argo CD admin password (stored in argocd_admin_password.txt, hidden here)."
+
+      - name: Login to Argo CD
+        env:
+          ARGOCD_SERVER_HOST: ${{ steps.argocd-lb.outputs.hostname }}
+        run: |
+          if [ -z "${ARGOCD_SERVER_HOST}" ]; then
+            echo "ARGOCD_SERVER_HOST not set. Check 'Expose Argo CD via LoadBalancer' step."
+            exit 1
+          fi
+
+          echo "Logging into Argo CD at ${ARGOCD_SERVER_HOST}..."
+          argocd login "${ARGOCD_SERVER_HOST}" \
+            --username admin \
+            --password "$(cat argocd_admin_password.txt)" \
+            --insecure
+
+      - name: Register current EKS cluster in Argo CD
+        run: |
+          CURRENT_CONTEXT="$(kubectl config current-context)"
+          echo "Current kubectl context: ${CURRENT_CONTEXT}"
+
+          if argocd cluster list | grep -q "${CURRENT_CONTEXT}"; then
+            echo "Cluster ${CURRENT_CONTEXT} already registered."
+          else
+            echo "Registering cluster ${CURRENT_CONTEXT} into Argo CD..."
+            argocd cluster add "${CURRENT_CONTEXT}" --yes
+          fi
+
+      - name: Register Git repo in Argo CD
+        env:
+          ARGOCD_APP_REPO_URL: ${{ env.ARGOCD_APP_REPO_URL }}
+          ARGOCD_REPO_USERNAME: git
+          ARGOCD_REPO_PASSWORD: ${{ secrets.ARGOCD_REPO_TOKEN }}
+        run: |
+          if [ -z "${ARGOCD_APP_REPO_URL}" ]; then
+            echo "ARGOCD_APP_REPO_URL is not set."
+            exit 1
+          fi
+
+          if [ -z "${ARGOCD_REPO_PASSWORD}" ]; then
+            echo "ARGOCD_REPO_TOKEN (ARGOCD_REPO_PASSWORD) secret is not set."
+            exit 1
+          fi
+
+          echo "Registering Git repo ${ARGOCD_APP_REPO_URL} in Argo CD..."
+          if argocd repo list | grep -q "${ARGOCD_APP_REPO_URL}"; then
+            echo "Repo ${ARGOCD_APP_REPO_URL} is already registered."
+          else
+            argocd repo add "${ARGOCD_APP_REPO_URL}" \
+              --username "${ARGOCD_REPO_USERNAME}" \
+              --password "${ARGOCD_REPO_PASSWORD}" \
+              --upsert
+          fi
+
+      - name: Ensure destination namespace exists
+        env:
+          ARGOCD_APP_DEST_NAMESPACE: ${{ env.ARGOCD_APP_DEST_NAMESPACE }}
+        run: |
+          if ! kubectl get namespace "${ARGOCD_APP_DEST_NAMESPACE}" >/dev/null 2>&1; then
+            echo "Creating namespace ${ARGOCD_APP_DEST_NAMESPACE}..."
+            kubectl create namespace "${ARGOCD_APP_DEST_NAMESPACE}"
+          else
+            echo "Namespace ${ARGOCD_APP_DEST_NAMESPACE} already exists."
+          fi
+
+      - name: Create & auto-sync Argo CD Application
+        env:
+          ARGOCD_APP_NAME: ${{ env.ARGOCD_APP_NAME }}
+          ARGOCD_APP_REPO_URL: ${{ env.ARGOCD_APP_REPO_URL }}
+          ARGOCD_APP_PATH: ${{ env.ARGOCD_APP_PATH }}
+          ARGOCD_APP_DEST_NAMESPACE: ${{ env.ARGOCD_APP_DEST_NAMESPACE }}
+        run: |
+          echo "Configuring Argo CD Application '${ARGOCD_APP_NAME}'..."
+
+          if argocd app get "${ARGOCD_APP_NAME}" >/dev/null 2>&1; then
+            echo "Application ${ARGOCD_APP_NAME} already exists. Updating config..."
+            argocd app set "${ARGOCD_APP_NAME}" \
+              --repo "${ARGOCD_APP_REPO_URL}" \
+              --path "${ARGOCD_APP_PATH}" \
+              --dest-server "https://kubernetes.default.svc" \
+              --dest-namespace "${ARGOCD_APP_DEST_NAMESPACE}" \
+              --sync-policy automated \
+              --self-heal \
+              --auto-prune
+          else
+            echo "Creating Argo CD Application ${ARGOCD_APP_NAME}..."
+            argocd app create "${ARGOCD_APP_NAME}" \
+              --repo "${ARGOCD_APP_REPO_URL}" \
+              --path "${ARGOCD_APP_PATH}" \
+              --dest-server "https://kubernetes.default.svc" \
+              --dest-namespace "${ARGOCD_APP_DEST_NAMESPACE}" \
+              --project default \
+              --sync-policy automated \
+              --self-heal \
+              --auto-prune
+          fi
+
+          echo "Triggering initial sync for ${ARGOCD_APP_NAME}..."
+          argocd app sync "${ARGOCD_APP_NAME}"
+
+      - name: Final message
+        run: |
+          echo "EKS cluster '${CLUSTER_NAME_TRIMMED}' is up."
+          echo "Argo CD is installed and accessible via LoadBalancer."
+          echo "Application '${ARGOCD_APP_NAME}' is configured for auto-sync from '${ARGOCD_APP_REPO_URL}/${ARGOCD_APP_PATH}'."
+          echo "Any commit to that path will be deployed automatically."
