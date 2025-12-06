@@ -1,3 +1,4 @@
+
 name: Cleanup EKS Cluster with eksctl
 
 on:
@@ -46,10 +47,10 @@ jobs:
           CLEAN_NAME=$(echo "${CLUSTER_NAME}" | xargs)
           echo "Trimmed cluster name: '${CLEAN_NAME}'"
 
-          # Basic validation
-          if ! echo "${CLEAN_NAME}" | grep -Eq '^[0-9A-Za-z][A-Za-z0-9-_]*$'; then
-            echo "ERROR: Trimmed cluster name '${CLEAN_NAME}' is still invalid."
-            echo "It must match: ^[0-9A-Za-z][A-Za-z0-9-_]*$"
+          # Basic validation - note the character class uses _- (NOT -_)
+          if ! printf '%s\n' "${CLEAN_NAME}" | grep -Eq '^[0-9A-Za-z][A-Za-z0-9_-]*$'; then
+            echo "ERROR: Trimmed cluster name '${CLEAN_NAME}' is invalid."
+            echo "It must match: ^[0-9A-Za-z][A-Za-z0-9_-]*$"
             exit 1
           fi
 
