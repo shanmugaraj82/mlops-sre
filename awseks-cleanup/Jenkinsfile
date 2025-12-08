@@ -1,0 +1,349 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION      = 'us-east-1'
+    CLUSTER_NAME    = 'diabetic3-eks'
+    ECR_REPOSITORY  = 'diabetes-api'
+    OIDC_PROVIDER_ID = 'F2DECE25FA9BF2E872C42D7F930DB590'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Install AWS CLI, eksctl, kubectl, Helm (no sudo)') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+
+            echo "[SETUP] Preparing $HOME/bin..."
+            mkdir -p "$HOME/bin"
+            export PATH="$HOME/bin:$PATH"
+
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[SETUP] Checking AWS CLI..."
+            if ! command -v aws >/dev/null 2>&1; then
+              echo "[SETUP] Installing AWS CLI v2..."
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              rm -rf aws aws-cli
+              unzip -q awscliv2.zip
+              ./aws/install --bin-dir "$HOME/bin" --install-dir "$HOME/aws-cli" --update
+            fi
+
+            echo "[SETUP] Checking eksctl..."
+            if ! command -v eksctl >/dev/null 2>&1; then
+              echo "[SETUP] Installing eksctl..."
+              curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+                | tar xz -C "$HOME/bin"
+              chmod +x "$HOME/bin/eksctl"
+            fi
+
+            echo "[SETUP] Checking kubectl..."
+            if ! command -v kubectl >/dev/null 2>&1; then
+              echo "[SETUP] Installing kubectl..."
+              KUBECTL_VERSION="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+              curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+              chmod +x "$HOME/bin/kubectl"
+            fi
+
+            echo "[SETUP] Checking Helm..."
+            if ! command -v helm >/dev/null 2>&1; then
+              echo "[SETUP] Installing Helm..."
+              curl -L https://get.helm.sh/helm-v3.15.4-linux-amd64.tar.gz -o /tmp/helm.tar.gz
+              tar -zxvf /tmp/helm.tar.gz -C /tmp >/dev/null
+              mv /tmp/linux-amd64/helm "$HOME/bin/helm"
+              chmod +x "$HOME/bin/helm"
+            fi
+
+            echo "[SETUP] Versions:"
+            aws --version || true
+            eksctl version || true
+            kubectl version --client || true
+            helm version || true
+          '''
+        }
+      }
+    }
+
+    stage('Init kubeconfig (if cluster exists)') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks_cleanup"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
+            echo "[CLEANUP] Checking if EKS cluster ${CLUSTER_NAME} exists..."
+            if aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+              echo "[CLEANUP] Cluster exists. Updating kubeconfig..."
+              aws eks update-kubeconfig \
+                --name "${CLUSTER_NAME}" \
+                --region "${AWS_REGION}" \
+                --kubeconfig "$KUBECONFIG_FILE"
+
+              echo "[CLEANUP] kubeconfig initialized."
+            else
+              echo "[CLEANUP] Cluster ${CLUSTER_NAME} does not exist (skipping kubeconfig init)."
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Delete Kubernetes workloads & Ingress (if reachable)') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set +e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks_cleanup"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
+            echo "[CLEANUP] Testing kubectl connectivity..."
+            kubectl get nodes >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+              echo "[CLEANUP] Cannot talk to cluster (maybe already deleted). Skipping K8s deletion."
+              exit 0
+            fi
+
+            echo "[CLEANUP] Deleting diabetes API ingress/service/deployment (if present)..."
+            kubectl delete ingress diabetes-api-ingress --ignore-not-found
+            kubectl delete service diabetes-api-service --ignore-not-found
+            kubectl delete deployment diabetes-api --ignore-not-found
+
+            echo "[CLEANUP] Optionally delete all ingresses in default namespace..."
+            kubectl delete ingress --all --ignore-not-found
+
+            echo "[CLEANUP] Uninstall AWS Load Balancer Controller Helm release (if present)..."
+            helm uninstall aws-load-balancer-controller -n kube-system >/dev/null 2>&1 || true
+
+            echo "[CLEANUP] Done with K8s-level cleanup."
+          '''
+        }
+      }
+    }
+
+    stage('Delete ALBs associated with cluster') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[ALB] Locating ALBs tagged for cluster ${CLUSTER_NAME}..."
+
+            LB_ARNS=$(aws elbv2 describe-load-balancers \
+              --region "${AWS_REGION}" \
+              --query "LoadBalancers[?starts_with(LoadBalancerName, 'k8s-')].LoadBalancerArn" \
+              --output text || true)
+
+            if [ -z "$LB_ARNS" ]; then
+              echo "[ALB] No k8s-* ALBs found."
+            else
+              for ARN in $LB_ARNS; do
+                echo "[ALB] Checking tags for $ARN..."
+                TAG_MATCH=$(aws elbv2 describe-tags \
+                  --region "${AWS_REGION}" \
+                  --resource-arns "$ARN" \
+                  --query "TagDescriptions[0].Tags[?Key=='kubernetes.io/cluster/${CLUSTER_NAME}'].Value" \
+                  --output text || true)
+
+                if [ -n "$TAG_MATCH" ]; then
+                  echo "[ALB] Deleting ALB $ARN (cluster=${CLUSTER_NAME})..."
+                  aws elbv2 delete-load-balancer \
+                    --region "${AWS_REGION}" \
+                    --load-balancer-arn "$ARN" || true
+                else
+                  echo "[ALB] Skipping $ARN (not tagged for cluster ${CLUSTER_NAME})."
+                fi
+              done
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Delete IAM role & policy for AWS Load Balancer Controller') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+            ROLE_NAME="AmazonEKSLoadBalancerControllerRole"
+            POLICY_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:policy/AWSLoadBalancerControllerIAMPolicy"
+
+            echo "[IAM] Detaching policy from role (if attached)..."
+            if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+              aws iam detach-role-policy \
+                --role-name "$ROLE_NAME" \
+                --policy-arn "$POLICY_ARN" || true
+
+              echo "[IAM] Deleting role $ROLE_NAME..."
+              aws iam delete-role --role-name "$ROLE_NAME" || true
+            else
+              echo "[IAM] Role $ROLE_NAME does not exist."
+            fi
+
+            echo "[IAM] Deleting policy $POLICY_ARN (if not used elsewhere)..."
+            if aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
+              aws iam delete-policy --policy-arn "$POLICY_ARN" || true
+            else
+              echo "[IAM] Policy $POLICY_ARN does not exist."
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Delete ECR repository (diabetes-api)') {
+      when {
+        expression { return env.ECR_REPOSITORY?.trim() }
+      }
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[ECR] Attempting to delete ECR repository ${ECR_REPOSITORY} (force)..."
+            aws ecr delete-repository \
+              --region "${AWS_REGION}" \
+              --repository-name "${ECR_REPOSITORY}" \
+              --force || echo "[ECR] Repo ${ECR_REPOSITORY} may not exist. Skipping."
+          '''
+        }
+      }
+    }
+
+    stage('Delete EKS cluster via eksctl') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[EKS] Deleting cluster ${CLUSTER_NAME} via eksctl..."
+
+            if eksctl get cluster --region "${AWS_REGION}" --name "${CLUSTER_NAME}" >/dev/null 2>&1; then
+              eksctl delete cluster \
+                --name "${CLUSTER_NAME}" \
+                --region "${AWS_REGION}" \
+                --disable-nodegroup-eviction \
+                --wait
+              echo "[EKS] Cluster ${CLUSTER_NAME} deleted."
+            else
+              echo "[EKS] Cluster ${CLUSTER_NAME} does not exist. Skipping deletion."
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Delete OIDC Provider for Cluster') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+
+            PROVIDER_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:oidc-provider/oidc.eks.${AWS_REGION}.amazonaws.com/id/${OIDC_PROVIDER_ID}"
+
+            echo "[OIDC] Attempting to delete OIDC provider: $PROVIDER_ARN"
+
+            if aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?Arn=='$PROVIDER_ARN'].Arn" --output text | grep -q "$PROVIDER_ARN"; then
+              aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$PROVIDER_ARN" || true
+              echo "[OIDC] OIDC provider deleted (or delete attempted)."
+            else
+              echo "[OIDC] OIDC provider $PROVIDER_ARN does not exist. Skipping."
+            fi
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "✅ Cleanup completed. Cluster ${env.CLUSTER_NAME}, ALBs, IAM role/policy, ECR repo ${env.ECR_REPOSITORY}, and OIDC provider have been cleaned up (as far as possible)."
+    }
+    failure {
+      echo "❌ Cleanup pipeline failed. Check logs above; some resources may remain."
+    }
+  }
+}
