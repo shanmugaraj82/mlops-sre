@@ -3,8 +3,8 @@ pipeline {
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'diabetic2-eks'
-    EKS_VERSION     = '1.33'              // keep as-is if it's working for you / auto-mode
+    CLUSTER_NAME    = 'diabetic-eks'
+    EKS_VERSION     = '1.29'              // adjust to an actually supported version
     NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
     NODE_COUNT      = '2'
@@ -204,13 +204,15 @@ EOF
               echo "[IRSA] Updating assume role policy for $ROLE_NAME..."
               aws iam update-assume-role-policy \
                 --role-name "$ROLE_NAME" \
-                --assume-role-policy-document file:///tmp/trust-policy.json
+                --policy-document file:///tmp/trust-policy.json
             fi
 
             echo "[IRSA] Attaching IAM policy to role..."
-            if ! aws iam list-attached-role-policies --role-name "$ROLE_NAME" \
+            ATTACHED_COUNT=$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" \
               --query "AttachedPolicies[?PolicyArn=='$POLICY_ARN'] | length(@)" \
-              --output text | grep -q '^1$'; then
+              --output text)
+
+            if [ "$ATTACHED_COUNT" -ne 1 ]; then
               aws iam attach-role-policy \
                 --role-name "$ROLE_NAME" \
                 --policy-arn "$POLICY_ARN"
@@ -355,8 +357,9 @@ EOF
             echo "[APP] Current Ingress state:"
             kubectl get ingress diabetes-api-ingress -o wide
 
-            echo "[APP] You can run this once pipeline finishes to get the ALB URL:"
+            echo "[APP] Once pipeline finishes, get the ALB URL with:"
             echo "  kubectl get ingress diabetes-api-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+            echo "Then open:  http://\$(kubectl get ingress diabetes-api-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')/docs"
           '''
         }
       }
@@ -365,7 +368,7 @@ EOF
 
   post {
     success {
-      echo "✅ EKS cluster ${env.CLUSTER_NAME} created and diabetes API exposed via ALB in ${env.AWS_REGION}."
+      echo "✅ EKS cluster ${env.CLUSTER_NAME} created, ALB controller installed, and diabetes API exposed via ALB in ${env.AWS_REGION}."
     }
     failure {
       echo "❌ Pipeline failed. Check logs above."
