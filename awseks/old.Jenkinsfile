@@ -1,0 +1,133 @@
+
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION      = 'us-east-1'
+    CLUSTER_NAME    = 'diabetic-eks'
+    EKS_VERSION     = '1.33'              // adjust as needed / or match your actual EKS version
+    NODEGROUP_NAME  = 'ng-default'        // kept for future use (not used with Auto Mode)
+    NODE_TYPE       = 't3.small'
+    NODE_COUNT      = '2'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Install AWS CLI, eksctl & kubectl (no sudo)') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+
+            echo "[SETUP] Preparing $HOME/bin..."
+            mkdir -p "$HOME/bin"
+            export PATH="$HOME/bin:$PATH"
+
+            echo "[SETUP] Ensuring AWS region env vars..."
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[SETUP] Checking AWS CLI..."
+            if ! command -v aws >/dev/null 2>&1; then
+              echo "[SETUP] AWS CLI not found. Installing AWS CLI v2 into $HOME..."
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              rm -rf aws aws-cli
+              unzip -q awscliv2.zip
+              ./aws/install --bin-dir "$HOME/bin" --install-dir "$HOME/aws-cli" --update
+            else
+              echo "[SETUP] AWS CLI already installed."
+            fi
+
+            echo "[SETUP] Checking eksctl..."
+            if ! command -v eksctl >/dev/null 2>&1; then
+              echo "[SETUP] eksctl not found. Installing eksctl into $HOME/bin..."
+              curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+                | tar xz -C "$HOME/bin"
+              chmod +x "$HOME/bin/eksctl"
+            else
+              echo "[SETUP] eksctl already installed."
+            fi
+
+            echo "[SETUP] Checking kubectl..."
+            if ! command -v kubectl >/dev/null 2>&1; then
+              echo "[SETUP] kubectl not found. Installing pinned kubectl (v1.25.16) into $HOME/bin to avoid ExecCredential issues..."
+
+              # Pin kubectl to a version that still supports ExecCredential v1alpha1
+              KUBECTL_VERSION="v1.25.16"
+              echo "[SETUP] Using kubectl version: $KUBECTL_VERSION"
+
+              curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+              chmod +x "$HOME/bin/kubectl"
+            else
+              echo "[SETUP] kubectl already installed."
+            fi
+
+            echo "[SETUP] aws version:"
+            aws --version || true
+
+            echo "[SETUP] eksctl version:"
+            eksctl version || true
+
+            echo "[SETUP] kubectl version:"
+            kubectl version --client || true
+          '''
+        }
+      }
+    }
+
+    stage('Create EKS Cluster (Auto Mode)') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            # Use a dedicated kubeconfig file for this build
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
+            echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION} with Auto Mode enabled..."
+
+            # With Auto Mode enabled, do NOT pass --nodes / --node-type / --nodegroup-name
+            eksctl create cluster \
+              --name "${CLUSTER_NAME}" \
+              --version "${EKS_VERSION}" \
+              --region "${AWS_REGION}" \
+              --enable-auto-mode
+
+            echo "[EKS] Cluster ${CLUSTER_NAME} created."
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "✅ EKS cluster ${env.CLUSTER_NAME} created successfully in ${env.AWS_REGION}."
+    }
+    failure {
+      echo "❌ EKS cluster creation failed. Check the stage logs above."
+    }
+  }
+}

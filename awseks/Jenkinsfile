@@ -1,12 +1,11 @@
-
 pipeline {
   agent any
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'diabetic-eks'
-    EKS_VERSION     = '1.33'              // adjust as needed / or match your actual EKS version
-    NODEGROUP_NAME  = 'ng-default'        // kept for future use (not used with Auto Mode)
+    CLUSTER_NAME    = 'diabetic2-eks'
+    EKS_VERSION     = '1.33'              // keep as-is if it's working for you / auto-mode
+    NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
     NODE_COUNT      = '2'
   }
@@ -61,9 +60,8 @@ pipeline {
 
             echo "[SETUP] Checking kubectl..."
             if ! command -v kubectl >/dev/null 2>&1; then
-              echo "[SETUP] kubectl not found. Installing pinned kubectl (v1.25.16) into $HOME/bin to avoid ExecCredential issues..."
+              echo "[SETUP] kubectl not found. Installing pinned kubectl (v1.25.16) into $HOME/bin..."
 
-              # Pin kubectl to a version that still supports ExecCredential v1alpha1
               KUBECTL_VERSION="v1.25.16"
               echo "[SETUP] Using kubectl version: $KUBECTL_VERSION"
 
@@ -108,7 +106,6 @@ pipeline {
 
             echo "[EKS] Creating EKS cluster ${CLUSTER_NAME} in ${AWS_REGION} with Auto Mode enabled..."
 
-            # With Auto Mode enabled, do NOT pass --nodes / --node-type / --nodegroup-name
             eksctl create cluster \
               --name "${CLUSTER_NAME}" \
               --version "${EKS_VERSION}" \
@@ -120,14 +117,258 @@ pipeline {
         }
       }
     }
+
+    stage('Set up IRSA & IAM Role for AWS Load Balancer Controller') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
+            echo "[IRSA] Associating IAM OIDC provider (idempotent)..."
+            eksctl utils associate-iam-oidc-provider \
+              --cluster "${CLUSTER_NAME}" \
+              --region "${AWS_REGION}" \
+              --approve || true
+
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+            echo "[IRSA] AWS Account ID: $AWS_ACCOUNT_ID"
+
+            echo "[IRSA] Downloading AWS Load Balancer Controller IAM policy..."
+            curl -sSL -o /tmp/aws-lbc-iam-policy.json \
+              "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json"
+
+            POLICY_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:policy/AWSLoadBalancerControllerIAMPolicy"
+
+            echo "[IRSA] Ensuring IAM policy exists..."
+            if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
+              echo "[IRSA] Creating IAM policy AWSLoadBalancerControllerIAMPolicy..."
+              aws iam create-policy \
+                --policy-name AWSLoadBalancerControllerIAMPolicy \
+                --policy-document file:///tmp/aws-lbc-iam-policy.json
+            else
+              echo "[IRSA] IAM policy already exists."
+            fi
+
+            echo "[IRSA] Building trust policy for IRSA role..."
+            OIDC_ISSUER=$(aws eks describe-cluster \
+              --name "${CLUSTER_NAME}" \
+              --region "${AWS_REGION}" \
+              --query "cluster.identity.oidc.issuer" \
+              --output text)
+
+            OIDC_ID=${OIDC_ISSUER##*/}
+            echo "[IRSA] OIDC issuer: $OIDC_ISSUER"
+            echo "[IRSA] OIDC ID: $OIDC_ID"
+
+            cat > /tmp/trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::$AWS_ACCOUNT_ID:oidc-provider/oidc.eks.${AWS_REGION}.amazonaws.com/id/$OIDC_ID"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.${AWS_REGION}.amazonaws.com/id/$OIDC_ID:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+            ROLE_NAME="AmazonEKSLoadBalancerControllerRole"
+
+            echo "[IRSA] Ensuring IAM role $ROLE_NAME exists..."
+            if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+              echo "[IRSA] Creating IAM role $ROLE_NAME..."
+              aws iam create-role \
+                --role-name "$ROLE_NAME" \
+                --assume-role-policy-document file:///tmp/trust-policy.json
+            else
+              echo "[IRSA] Updating assume role policy for $ROLE_NAME..."
+              aws iam update-assume-role-policy \
+                --role-name "$ROLE_NAME" \
+                --assume-role-policy-document file:///tmp/trust-policy.json
+            fi
+
+            echo "[IRSA] Attaching IAM policy to role..."
+            if ! aws iam list-attached-role-policies --role-name "$ROLE_NAME" \
+              --query "AttachedPolicies[?PolicyArn=='$POLICY_ARN'] | length(@)" \
+              --output text | grep -q '^1$'; then
+              aws iam attach-role-policy \
+                --role-name "$ROLE_NAME" \
+                --policy-arn "$POLICY_ARN"
+            else
+              echo "[IRSA] Policy already attached."
+            fi
+          '''
+        }
+      }
+    }
+
+    stage('Install AWS Load Balancer Controller via Helm') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
+            echo "[LBC] Installing Helm if needed..."
+            if ! command -v helm >/dev/null 2>&1; then
+              curl -L https://get.helm.sh/helm-v3.15.4-linux-amd64.tar.gz -o /tmp/helm.tar.gz
+              tar -zxvf /tmp/helm.tar.gz -C /tmp >/dev/null
+              mv /tmp/linux-amd64/helm "$HOME/bin/helm"
+              chmod +x "$HOME/bin/helm"
+            fi
+
+            echo "[LBC] Adding EKS Helm repo..."
+            helm repo add eks https://aws.github.io/eks-charts || true
+            helm repo update
+
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+            ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/AmazonEKSLoadBalancerControllerRole"
+
+            echo "[LBC] Getting VPC ID for cluster..."
+            VPC_ID=$(aws eks describe-cluster \
+              --name "${CLUSTER_NAME}" \
+              --region "${AWS_REGION}" \
+              --query "cluster.resourcesVpcConfig.vpcId" \
+              --output text)
+
+            echo "[LBC] VPC ID: $VPC_ID"
+            echo "[LBC] Installing/upgrading aws-load-balancer-controller..."
+
+            helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+              -n kube-system \
+              --create-namespace \
+              --set clusterName="${CLUSTER_NAME}" \
+              --set region="${AWS_REGION}" \
+              --set vpcId="$VPC_ID" \
+              --set serviceAccount.create=true \
+              --set serviceAccount.name=aws-load-balancer-controller \
+              --set serviceAccount.annotations."eks\\.amazonaws\\.com/role-arn"="$ROLE_ARN"
+
+            echo "[LBC] Waiting for controller deployment to be ready..."
+            kubectl rollout status deployment/aws-load-balancer-controller -n kube-system
+          '''
+        }
+      }
+    }
+
+    stage('Tag Public Subnets for ALB') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            echo "[ALB] Discovering VPC & public subnets for cluster..."
+
+            VPC_ID=$(aws eks describe-cluster \
+              --name "${CLUSTER_NAME}" \
+              --region "${AWS_REGION}" \
+              --query "cluster.resourcesVpcConfig.vpcId" \
+              --output text)
+
+            echo "[ALB] Cluster VPC: $VPC_ID"
+
+            PUBLIC_SUBNETS=$(aws ec2 describe-route-tables \
+              --region "${AWS_REGION}" \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=route.gateway-id,Values=igw-*" \
+              --query "RouteTables[].Associations[].SubnetId" \
+              --output text)
+
+            echo "[ALB] Public subnets with IGW route: $PUBLIC_SUBNETS"
+
+            for SUBNET in $PUBLIC_SUBNETS; do
+              echo "[ALB] Tagging subnet $SUBNET for cluster + elb..."
+              aws ec2 create-tags \
+                --region "${AWS_REGION}" \
+                --resources "$SUBNET" \
+                --tags Key=kubernetes.io/cluster/${CLUSTER_NAME},Value=shared \
+                       Key=kubernetes.io/role/elb,Value=1
+            done
+          '''
+        }
+      }
+    }
+
+    stage('Deploy Diabetes API & Ingress (ALB)') {
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-jenkins-creds',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          sh '''
+            set -e
+            export PATH="$HOME/bin:$PATH"
+            export AWS_REGION="${AWS_REGION}"
+            export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+            KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
+            export KUBECONFIG="$KUBECONFIG_FILE"
+
+            echo "[APP] Applying Deployment + Service..."
+            kubectl apply -f k8s-deploy.yml
+
+            echo "[APP] Applying Ingress..."
+            kubectl apply -f k8s-ingress.yml
+
+            echo "[APP] Current Ingress state:"
+            kubectl get ingress diabetes-api-ingress -o wide
+
+            echo "[APP] You can run this once pipeline finishes to get the ALB URL:"
+            echo "  kubectl get ingress diabetes-api-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
+          '''
+        }
+      }
+    }
   }
 
   post {
     success {
-      echo "✅ EKS cluster ${env.CLUSTER_NAME} created successfully in ${env.AWS_REGION}."
+      echo "✅ EKS cluster ${env.CLUSTER_NAME} created and diabetes API exposed via ALB in ${env.AWS_REGION}."
     }
     failure {
-      echo "❌ EKS cluster creation failed. Check the stage logs above."
+      echo "❌ Pipeline failed. Check logs above."
     }
   }
 }
