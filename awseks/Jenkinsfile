@@ -3,7 +3,7 @@ pipeline {
 
   environment {
     AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'diabetic3-eks'
+    CLUSTER_NAME    = 'diabetic-api-eks'
     EKS_VERSION     = '1.33'              // adjust to an actually supported version
     NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
