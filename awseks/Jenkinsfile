@@ -4,7 +4,7 @@ pipeline {
   environment {
     AWS_REGION      = 'us-east-1'
     CLUSTER_NAME    = 'diabetic-api-eks'
-    EKS_VERSION     = '1.33'              // adjust to an actually supported version
+    EKS_VERSION     = '1.33'              // adjust to valid/supported EKS version
     NODEGROUP_NAME  = 'ng-default'
     NODE_TYPE       = 't3.small'
     NODE_COUNT      = '2'
@@ -17,7 +17,7 @@ pipeline {
       }
     }
 
-    stage('Install AWS CLI, eksctl & kubectl (no sudo)') {
+    stage('Install AWS CLI, eksctl, kubectl, Helm (no sudo)') {
       steps {
         withCredentials([
           usernamePassword(
@@ -60,15 +60,24 @@ pipeline {
 
             echo "[SETUP] Checking kubectl..."
             if ! command -v kubectl >/dev/null 2>&1; then
-              echo "[SETUP] kubectl not found. Installing pinned kubectl (v1.25.16) into $HOME/bin..."
-
-              KUBECTL_VERSION="v1.25.16"
+              echo "[SETUP] kubectl not found. Installing latest stable kubectl into $HOME/bin..."
+              KUBECTL_VERSION="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
               echo "[SETUP] Using kubectl version: $KUBECTL_VERSION"
-
               curl -fsSLo "$HOME/bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
               chmod +x "$HOME/bin/kubectl"
             else
               echo "[SETUP] kubectl already installed."
+            fi
+
+            echo "[SETUP] Checking Helm..."
+            if ! command -v helm >/dev/null 2>&1; then
+              echo "[SETUP] Helm not found. Installing Helm into $HOME/bin..."
+              curl -L https://get.helm.sh/helm-v3.15.4-linux-amd64.tar.gz -o /tmp/helm.tar.gz
+              tar -zxvf /tmp/helm.tar.gz -C /tmp >/dev/null
+              mv /tmp/linux-amd64/helm "$HOME/bin/helm"
+              chmod +x "$HOME/bin/helm"
+            else
+              echo "[SETUP] Helm already installed."
             fi
 
             echo "[SETUP] aws version:"
@@ -79,6 +88,9 @@ pipeline {
 
             echo "[SETUP] kubectl version:"
             kubectl version --client || true
+
+            echo "[SETUP] helm version:"
+            helm version || true
           '''
         }
       }
@@ -113,6 +125,15 @@ pipeline {
               --enable-auto-mode
 
             echo "[EKS] Cluster ${CLUSTER_NAME} created."
+
+            echo "[EKS] Regenerating kubeconfig with aws eks update-kubeconfig (ExecCredential v1)..."
+            aws eks update-kubeconfig \
+              --name "${CLUSTER_NAME}" \
+              --region "${AWS_REGION}" \
+              --kubeconfig "$KUBECONFIG_FILE"
+
+            echo "[EKS] kubeconfig contents (sanity):"
+            kubectl config view
           '''
         }
       }
@@ -242,14 +263,6 @@ EOF
             KUBECONFIG_FILE="$WORKSPACE/kubeconfig_eks"
             export KUBECONFIG="$KUBECONFIG_FILE"
 
-            echo "[LBC] Installing Helm if needed..."
-            if ! command -v helm >/dev/null 2>&1; then
-              curl -L https://get.helm.sh/helm-v3.15.4-linux-amd64.tar.gz -o /tmp/helm.tar.gz
-              tar -zxvf /tmp/helm.tar.gz -C /tmp >/dev/null
-              mv /tmp/linux-amd64/helm "$HOME/bin/helm"
-              chmod +x "$HOME/bin/helm"
-            fi
-
             echo "[LBC] Adding EKS Helm repo..."
             helm repo add eks https://aws.github.io/eks-charts || true
             helm repo update
@@ -359,7 +372,8 @@ EOF
 
             echo "[APP] Once pipeline finishes, get the ALB URL with:"
             echo "  kubectl get ingress diabetes-api-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
-            echo "Then open:  http://\$(kubectl get ingress diabetes-api-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')/docs"
+            echo "Then open:"
+            echo "  http://$(kubectl get ingress diabetes-api-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')/docs"
           '''
         }
       }
