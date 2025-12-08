@@ -1,11 +1,36 @@
 pipeline {
   agent any
 
+  // ✅ Ask user for values before the pipeline starts
+  parameters {
+    string(
+      name: 'EKS_CLUSTER_NAME',
+      defaultValue: 'diabetic3-eks',
+      description: 'Name of the EKS cluster to clean up (e.g., diabetic3-eks)'
+    )
+    string(
+      name: 'AWS_REGION',
+      defaultValue: 'us-east-1',
+      description: 'AWS region of the cluster (e.g., us-east-1)'
+    )
+    string(
+      name: 'ECR_REPOSITORY',
+      defaultValue: 'diabetes-api',
+      description: 'Name of the ECR repository to delete (e.g., diabetes-api). Leave as-is or change as needed.'
+    )
+    string(
+      name: 'OIDC_PROVIDER_ID',
+      defaultValue: 'F2DECE25FA9BF2E872C42D7F930DB590',
+      description: 'OIDC provider ID for the cluster (the last segment of the oidc URL).'
+    )
+  }
+
+  // Use the parameters as environment variables everywhere
   environment {
-    AWS_REGION      = 'us-east-1'
-    CLUSTER_NAME    = 'diabetic3-eks'
-    ECR_REPOSITORY  = 'diabetes-api'
-    OIDC_PROVIDER_ID = 'F2DECE25FA9BF2E872C42D7F930DB590'
+    AWS_REGION      = "${params.AWS_REGION}"
+    CLUSTER_NAME    = "${params.EKS_CLUSTER_NAME}"
+    ECR_REPOSITORY  = "${params.ECR_REPOSITORY}"
+    OIDC_PROVIDER_ID = "${params.OIDC_PROVIDER_ID}"
   }
 
   stages {
@@ -245,7 +270,7 @@ pipeline {
       }
     }
 
-    stage('Delete ECR repository (diabetes-api)') {
+    stage('Delete ECR repository (if provided)') {
       when {
         expression { return env.ECR_REPOSITORY?.trim() }
       }
