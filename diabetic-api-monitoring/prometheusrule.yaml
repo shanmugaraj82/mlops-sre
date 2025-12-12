@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: diabetic-api-rules
+  namespace: monitoring
+  labels:
+    release: monitoring-stack   # same release label as above
+spec:
+  groups:
+    - name: diabetic-api.rules
+      rules:
+        - alert: DiabeticApiDeploymentDown
+          expr: kube_deployment_status_replicas_available{
+                  namespace="default",
+                  deployment="diabetes-api"
+                } < 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "diabetes-api deployment has no available replicas"
+            description: "Deployment diabetes-api in namespace default has been down for more than 5 minutes."

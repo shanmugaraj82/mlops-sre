@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diabetes-api
+  labels:
+    app: diabetic-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: diabetic-api
+  template:
+    metadata:
+      labels:
+        app: diabetic-api
+    spec:
+      containers:
+        - name: diabetes-api
+          image: 226526203514.dkr.ecr.us-east-1.amazonaws.com/diabetes-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            # add any env vars your app needs here
+            # - name: ENV
+            #   value: "prod"
+            - name: PORT
+              value: "8000"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
