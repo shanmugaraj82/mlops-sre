@@ -2,18 +2,18 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: diabetic-api-sm
-  namespace: monitoring   # kube-prometheus-stack lives here
+  namespace: monitoring          # where kube-prometheus-stack is installed
   labels:
-    release: monitoring-stack   # <-- IMPORTANT: match your Helm release name
+    release: monitoring-stack    # MUST match your Prometheus Helm release name
 spec:
   selector:
     matchLabels:
-      app: diabetic-api         # matches Service label
+      app: diabetic-api          # MUST match labels on the *Service*
   namespaceSelector:
     matchNames:
-      - default                 # diabetic-api is in default namespace
+      - default                  # diabetic-api runs in default namespace
   endpoints:
-    - port: http                # matches Service port name
+    - port: http                 # MUST match the port *name* on the Service
       path: /metrics
       interval: 15s
       scrapeTimeout: 10s

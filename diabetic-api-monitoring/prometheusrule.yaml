@@ -4,7 +4,7 @@ metadata:
   name: diabetic-api-rules
   namespace: monitoring
   labels:
-    release: monitoring-stack   # same release label as above
+    release: monitoring-stack     # same as in ServiceMonitor
 spec:
   groups:
     - name: diabetic-api.rules
@@ -18,5 +18,5 @@ spec:
           labels:
             severity: critical
           annotations:
-            summary: "diabetes-api deployment has no available replicas"
+            summary: "diabetes-api has no available replicas"
             description: "Deployment diabetes-api in namespace default has been down for more than 5 minutes."
