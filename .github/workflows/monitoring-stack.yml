@@ -52,20 +52,11 @@ jobs:
           kubectl get nodes
           kubectl get ns
 
-      # ----------------------------
-      # Install metrics-server
-      # ----------------------------
-      - name: Add metrics-server Helm repo
+      - name: Verify metrics-server (optional)
         run: |
-          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
-          helm repo update
-
-      - name: Install / upgrade metrics-server
-        run: |
-          helm upgrade --install metrics-server metrics-server/metrics-server \
-            --namespace kube-system \
-            --set args="{--kubelet-insecure-tls}" \
-            --set metrics.enabled=true
+          echo "Checking metrics API..."
+          kubectl get pods -n kube-system | grep -i metrics || echo "metrics-server pod not found"
+          kubectl top nodes || echo "kubectl top failed (metrics-server may not be ready yet)"
 
       # ----------------------------
       # Install Prometheus + Grafana via kube-prometheus-stack
