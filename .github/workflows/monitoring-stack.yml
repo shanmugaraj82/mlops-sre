@@ -1,0 +1,88 @@
+name: Deploy Monitoring Stack to EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "EKS Cluster name"
+        required: true
+        type: string
+      cluster_region:
+        description: "AWS region of the cluster (e.g. us-east-1)"
+        required: true
+        type: string
+
+jobs:
+  deploy-monitoring:
+    runs-on: ubuntu-latest
+
+    env:
+      CLUSTER_NAME: ${{ inputs.cluster_name }}
+      CLUSTER_REGION: ${{ inputs.cluster_region }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.CLUSTER_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "latest"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.2"
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name "${CLUSTER_NAME}" \
+            --region "${CLUSTER_REGION}"
+
+      - name: Verify cluster access
+        run: |
+          kubectl get nodes
+          kubectl get ns
+
+      # ----------------------------
+      # Install metrics-server
+      # ----------------------------
+      - name: Add metrics-server Helm repo
+        run: |
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+          helm repo update
+
+      - name: Install / upgrade metrics-server
+        run: |
+          helm upgrade --install metrics-server metrics-server/metrics-server \
+            --namespace kube-system \
+            --set args="{--kubelet-insecure-tls}" \
+            --set metrics.enabled=true
+
+      # ----------------------------
+      # Install Prometheus + Grafana via kube-prometheus-stack
+      # ----------------------------
+      - name: Add prometheus-community Helm repo
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Install / upgrade kube-prometheus-stack
+        run: |
+          helm upgrade --install monitoring-stack prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            -f monitoring/values-prometheus-grafana.yaml
+
+      - name: Show monitoring services
+        run: |
+          echo "---- monitoring namespace services ----"
+          kubectl get svc -n monitoring

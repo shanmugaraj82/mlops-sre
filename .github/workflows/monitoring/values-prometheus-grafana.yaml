@@ -1,0 +1,34 @@
+# Namespace: monitoring (we'll let Helm create it with --create-namespace)
+
+grafana:
+  enabled: true
+  adminUser: admin
+  adminPassword: admin1234   # For demo; override via secret in real setups
+
+  service:
+    type: LoadBalancer
+    port: 80
+    targetPort: 3000
+    # If you want to restrict source IPs, set annotations here for your cloud
+
+  # Optionally enable persistence if you want dashboards to survive pod restarts
+  persistence:
+    enabled: false
+    # storageClassName: gp2
+    # size: 10Gi
+
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    scrapeInterval: 30s
+
+alertmanager:
+  enabled: false  # turn on later if you need alerting
+
+# Optional: Reduce resources for small clusters
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+  tolerations: []
