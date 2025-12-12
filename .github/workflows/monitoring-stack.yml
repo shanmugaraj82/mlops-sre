@@ -71,7 +71,13 @@ jobs:
           helm upgrade --install monitoring-stack prometheus-community/kube-prometheus-stack \
             --namespace monitoring \
             --create-namespace \
-            -f monitoring/values-prometheus-grafana.yaml
+            --set grafana.enabled=true \
+            --set grafana.adminUser=admin \
+            --set grafana.adminPassword=admin1234 \
+            --set grafana.service.type=LoadBalancer \
+            --set grafana.service.port=80 \
+            --set grafana.service.targetPort=3000 \
+            --set prometheus.prometheusSpec.retention=15d
 
       - name: Show monitoring services
         run: |
