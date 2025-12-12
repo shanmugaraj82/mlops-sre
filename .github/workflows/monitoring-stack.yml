@@ -83,3 +83,19 @@ jobs:
         run: |
           echo "---- monitoring namespace services ----"
           kubectl get svc -n monitoring
+      - name: Deploy diabetes-api app and monitoring objects
+        run: |
+          echo "Applying diabetic-api manifests..."
+          kubectl apply -f diabetic-api-monitoring/deployment.yaml
+          kubectl apply -f diabetic-api-monitoring/service.yaml
+          kubectl apply -f diabetic-api-monitoring/servicemonitor.yaml
+          kubectl apply -f diabetic-api-monitoring/prometheusrule.yaml
+
+      - name: Check diabetes-api resources
+        run: |
+          echo "---- diabetes-api pods ----"
+          kubectl get pods -n default -l app=diabetic-api
+          echo "---- diabetes-api service ----"
+          kubectl get svc -n default -l app=diabetic-api
+          echo "---- monitoring objects ----"
+          kubectl get servicemonitor,prometheusrule -n monitoring | grep diabetic || true
