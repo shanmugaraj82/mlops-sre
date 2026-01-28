@@ -1,0 +1,65 @@
+name: 03 - Jenkins EC2 - Install Jenkins
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_dns:
+        description: "EC2 public DNS (from 02 workflow output)"
+        required: true
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup SSH key for EC2 access
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/jenkins-ec2-key
+          chmod 600 ~/.ssh/jenkins-ec2-key
+          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" >> ~/.ssh/config
+
+      - name: Wait for SSH (port 22)
+        run: |
+          PUBLIC_DNS="${{ inputs.public_dns }}"
+          for i in {1..50}; do
+            if ssh -o BatchMode=yes -o ConnectTimeout=5 -i ~/.ssh/jenkins-ec2-key ec2-user@"$PUBLIC_DNS" 'echo ok' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Install Jenkins on EC2
+        run: |
+          PUBLIC_DNS="${{ inputs.public_dns }}"
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" << 'EOF'
+          set -e
+          sudo yum update -y
+          sudo yum install -y fontconfig java-17-amazon-corretto git
+          sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+
+          sudo bash -c 'cat > /etc/yum.repos.d/jenkins.repo << "EOR"
+          [jenkins]
+          name=Jenkins-stable
+          baseurl=https://pkg.jenkins.io/redhat-stable
+          gpgcheck=1
+          gpgkey=https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+          EOR'
+
+          sudo yum install -y jenkins
+
+          JAVA_DIR=$(ls -d /usr/lib/jvm/java-17-* 2>/dev/null | head -n 1 || true)
+          test -n "$JAVA_DIR"
+          sudo sed -i '/^JENKINS_JAVA_CMD=/d' /etc/sysconfig/jenkins || true
+          echo "JENKINS_JAVA_CMD=$JAVA_DIR/bin/java" | sudo tee -a /etc/sysconfig/jenkins
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable jenkins
+          sudo systemctl restart jenkins
+          sudo systemctl status jenkins --no-pager
+          EOF
+
+      - name: Print URL
+        run: |
+          echo "http://${{ inputs.public_dns }}:8080"

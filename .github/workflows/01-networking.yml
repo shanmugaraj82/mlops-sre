@@ -1,0 +1,68 @@
+name: 01 - Jenkins EC2 - Network Prep
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  network:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find default VPC
+        id: vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          test -n "$VPC_ID" && test "$VPC_ID" != "None"
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Create/Reuse Jenkins SG
+        id: sg
+        run: |
+          SG_NAME="jenkins-sg"
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+
+          EXISTING_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
+
+          if [ "$EXISTING_SG_ID" = "None" ] || [ -z "$EXISTING_SG_ID" ]; then
+            SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "SG for Jenkins" --vpc-id "$VPC_ID" --query "GroupId" --output text)
+
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --ip-permissions '[
+              {"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]},
+              {"IpProtocol":"tcp","FromPort":8080,"ToPort":8080,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}
+            ]'
+          else
+            SG_ID="$EXISTING_SG_ID"
+          fi
+
+          echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Find default subnet
+        id: subnet
+        run: |
+          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" "Name=default-for-az,Values=true" --query "Subnets[0].SubnetId" --output text)
+          test -n "$SUBNET_ID" && test "$SUBNET_ID" != "None"
+          echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Print outputs (copy these)
+        run: |
+          echo "VPC_ID=${{ steps.vpc.outputs.vpc_id }}"
+          echo "SG_ID=${{ steps.sg.outputs.sg_id }}"
+          echo "SUBNET_ID=${{ steps.subnet.outputs.subnet_id }}"
