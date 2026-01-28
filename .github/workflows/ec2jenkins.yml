@@ -146,8 +146,8 @@ jobs:
           PUBLIC_DNS="${{ steps.ec2.outputs.public_dns }}"
           echo "Waiting for SSH on ${PUBLIC_DNS}:22..."
 
-          # Try up to 30 times (~5 minutes) to open an SSH session and run 'echo ok'
-          for i in {1..30}; do
+          # Try up to 50 times (~5 minutes) to open an SSH session and run 'echo ok'
+          for i in {1..50}; do
             echo "Attempt $i: trying SSH handshake..."
 
             if ssh -o BatchMode=yes -o ConnectTimeout=5 \
