@@ -1,0 +1,319 @@
+name: Deploy Jenkins EC2 (Resume Safe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Optional: resume a previous run. Leave blank to start a new run."
+        required: false
+      reset_state:
+        description: "Reset state for this run_id (dangerous)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  deploy-jenkins-ec2:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      STATE_PREFIX: /gitops/jenkins-ec2/runs
+      LATEST_PARAM: /gitops/jenkins-ec2/latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install jq + uuidgen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq uuid-runtime
+
+      # Decide RUN_ID: input.run_id -> latest pointer -> new UUID
+      - name: Decide RUN_ID
+        id: runid
+        run: |
+          set -euo pipefail
+
+          IN="${{ inputs.run_id }}"
+          if [ -n "${IN}" ]; then
+            RUN_ID="${IN}"
+            echo "Using provided run_id=${RUN_ID}"
+          else
+            # Try latest pointer
+            LATEST=$(aws ssm get-parameter --name "${LATEST_PARAM}" --query "Parameter.Value" --output text 2>/dev/null || true)
+            if [ -n "${LATEST}" ] && [ "${LATEST}" != "None" ]; then
+              RUN_ID="${LATEST}"
+              echo "No run_id provided. Using latest=${RUN_ID}"
+            else
+              RUN_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+              echo "No latest found. Creating new run_id=${RUN_ID}"
+            fi
+          fi
+
+          echo "RUN_ID=${RUN_ID}" >> $GITHUB_ENV
+          echo "state_param=${STATE_PREFIX}/${RUN_ID}" >> $GITHUB_OUTPUT
+
+      - name: Reset state (optional)
+        if: ${{ inputs.reset_state }}
+        run: |
+          set -e
+          PARAM="${{ steps.runid.outputs.state_param }}"
+          aws ssm delete-parameter --name "$PARAM" 2>/dev/null || true
+          echo '{}' > state.json
+          aws ssm put-parameter --name "$PARAM" --type String --value '{}' --overwrite
+
+      - name: Load state from SSM (or init)
+        id: state
+        run: |
+          set -euo pipefail
+          PARAM="${{ steps.runid.outputs.state_param }}"
+
+          STATE_JSON=$(aws ssm get-parameter --name "$PARAM" --query "Parameter.Value" --output text 2>/dev/null || true)
+          if [ -z "$STATE_JSON" ] || [ "$STATE_JSON" = "None" ]; then
+            STATE_JSON='{}'
+            echo "No prior state at $PARAM. Initializing."
+            aws ssm put-parameter --name "$PARAM" --type String --value "$STATE_JSON" --overwrite
+          else
+            echo "Loaded state from $PARAM"
+          fi
+
+          echo "$STATE_JSON" > state.json
+          jq . state.json
+
+      # Always save state at the end (even on failure)
+      - name: Save state to SSM (always)
+        if: always()
+        run: |
+          set -e
+          PARAM="${{ steps.runid.outputs.state_param }}"
+          aws ssm put-parameter --name "$PARAM" --type String --value "$(cat state.json)" --overwrite
+
+          # update "latest pointer" so next run can resume without typing run_id
+          aws ssm put-parameter --name "${LATEST_PARAM}" --type String --value "${RUN_ID}" --overwrite
+
+          echo "State saved to: $PARAM"
+          echo "Latest pointer: ${LATEST_PARAM}=${RUN_ID}"
+
+      - name: Print state pointers
+        run: |
+          echo "RUN_ID=${RUN_ID}"
+          echo "STATE_PARAM=${{ steps.runid.outputs.state_param }}"
+
+      # --- VPC ---
+      - name: Find default VPC (skip if already in state)
+        run: |
+          set -euo pipefail
+          if jq -e '.vpc_id? // empty' state.json >/dev/null; then
+            echo "vpc_id exists. Skipping."
+            exit 0
+          fi
+
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          test -n "$VPC_ID" && test "$VPC_ID" != "None"
+
+          jq --arg vpc "$VPC_ID" '.vpc_id=$vpc' state.json > state.tmp && mv state.tmp state.json
+          jq . state.json
+
+      # --- SG ---
+      - name: Create/Reuse Jenkins SG (skip if already in state)
+        run: |
+          set -euo pipefail
+          if jq -e '.sg_id? // empty' state.json >/dev/null; then
+            echo "sg_id exists. Skipping."
+            exit 0
+          fi
+
+          SG_NAME="jenkins-sg"
+          VPC_ID=$(jq -r '.vpc_id' state.json)
+
+          EXISTING_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text 2>/dev/null || true)
+
+          if [ "$EXISTING_SG_ID" = "None" ] || [ -z "$EXISTING_SG_ID" ]; then
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "Security group for Jenkins server" \
+              --vpc-id "$VPC_ID" \
+              --query "GroupId" --output text)
+
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --ip-permissions '[
+                {"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]},
+                {"IpProtocol":"tcp","FromPort":8080,"ToPort":8080,"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}
+              ]'
+          else
+            SG_ID="$EXISTING_SG_ID"
+          fi
+
+          jq --arg sg "$SG_ID" '.sg_id=$sg' state.json > state.tmp && mv state.tmp state.json
+          jq . state.json
+
+      # --- Subnet ---
+      - name: Find default subnet (skip if already in state)
+        run: |
+          set -euo pipefail
+          if jq -e '.subnet_id? // empty' state.json >/dev/null; then
+            echo "subnet_id exists. Skipping."
+            exit 0
+          fi
+
+          VPC_ID=$(jq -r '.vpc_id' state.json)
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=default-for-az,Values=true" \
+            --query "Subnets[0].SubnetId" --output text)
+
+          test -n "$SUBNET_ID" && test "$SUBNET_ID" != "None"
+
+          jq --arg sn "$SUBNET_ID" '.subnet_id=$sn' state.json > state.tmp && mv state.tmp state.json
+          jq . state.json
+
+      # --- EC2 launch/resume ---
+      - name: Launch/Resume EC2 (skip if running)
+        run: |
+          set -euo pipefail
+
+          AMI_ID="ami-0c02fb55956c7d316"
+          INSTANCE_TYPE="t3a.large"
+          KEY_NAME="${{ secrets.EC2_KEY_PAIR_NAME }}"
+
+          if jq -e '.instance_id? // empty' state.json >/dev/null; then
+            INSTANCE_ID=$(jq -r '.instance_id' state.json)
+            echo "Instance already exists: $INSTANCE_ID"
+
+            STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+              --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || true)
+
+            if [ "$STATE" != "running" ]; then
+              aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+            fi
+          else
+            SUBNET_ID=$(jq -r '.subnet_id' state.json)
+            SG_ID=$(jq -r '.sg_id' state.json)
+
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id "$AMI_ID" \
+              --instance-type "$INSTANCE_TYPE" \
+              --subnet-id "$SUBNET_ID" \
+              --security-group-ids "$SG_ID" \
+              --associate-public-ip-address \
+              --key-name "$KEY_NAME" \
+              --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=jenkins-server}]' \
+              --query "Instances[0].InstanceId" --output text)
+
+            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+            jq --arg iid "$INSTANCE_ID" '.instance_id=$iid' state.json > state.tmp && mv state.tmp state.json
+          fi
+
+          PUBLIC_DNS=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicDnsName" --output text)
+
+          jq --arg dns "$PUBLIC_DNS" '.public_dns=$dns' state.json > state.tmp && mv state.tmp state.json
+          jq . state.json
+
+      - name: Setup SSH key for EC2 access
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/jenkins-ec2-key
+          chmod 600 ~/.ssh/jenkins-ec2-key
+          printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" >> ~/.ssh/config
+
+      - name: Wait for SSH
+        run: |
+          set -e
+          PUBLIC_DNS=$(jq -r '.public_dns' state.json)
+          echo "Waiting for SSH on ${PUBLIC_DNS}:22..."
+          for i in {1..50}; do
+            if ssh -o BatchMode=yes -o ConnectTimeout=5 -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" 'echo ok' 2>/dev/null; then
+              echo "SSH ready."
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Install Jenkins (skip if already installed in state)
+        run: |
+          set -euo pipefail
+          if jq -e '.jenkins_installed=="true"' state.json >/dev/null; then
+            echo "jenkins_installed=true. Skipping."
+            exit 0
+          fi
+
+          PUBLIC_DNS=$(jq -r '.public_dns' state.json)
+
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" << 'EOF'
+          set -e
+          sudo yum update -y
+          sudo yum install -y fontconfig java-17-amazon-corretto git
+          sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+
+          sudo bash -c 'cat > /etc/yum.repos.d/jenkins.repo << "EOR"
+          [jenkins]
+          name=Jenkins-stable
+          baseurl=https://pkg.jenkins.io/redhat-stable
+          gpgcheck=1
+          gpgkey=https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+          EOR'
+
+          sudo yum install -y jenkins
+
+          JAVA_DIR=$(ls -d /usr/lib/jvm/java-17-* 2>/dev/null | head -n 1 || true)
+          test -n "$JAVA_DIR"
+          sudo sed -i '/^JENKINS_JAVA_CMD=/d' /etc/sysconfig/jenkins || true
+          echo "JENKINS_JAVA_CMD=$JAVA_DIR/bin/java" | sudo tee -a /etc/sysconfig/jenkins
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable jenkins
+          sudo systemctl restart jenkins
+
+          if ! sudo systemctl is-active --quiet jenkins; then
+            sudo systemctl status jenkins --no-pager || true
+            sudo journalctl -u jenkins --no-pager | tail -n 80 || true
+            exit 1
+          fi
+          EOF
+
+          jq '.jenkins_installed="true"' state.json > state.tmp && mv state.tmp state.json
+          jq . state.json
+
+      - name: Output Jenkins URL
+        run: |
+          PUBLIC_DNS=$(jq -r '.public_dns' state.json)
+          echo "Jenkins URL: http://${PUBLIC_DNS}:8080"
+
+      - name: Fetch Jenkins initial admin password (skip if already saved)
+        run: |
+          set -euo pipefail
+          if jq -e '.jenkins_password? // empty' state.json >/dev/null; then
+            echo "Password already stored in state. Printing it:"
+            jq -r '.jenkins_password' state.json
+            exit 0
+          fi
+
+          PUBLIC_DNS=$(jq -r '.public_dns' state.json)
+
+          for i in {1..20}; do
+            if ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "sudo test -f /var/lib/jenkins/secrets/initialAdminPassword"; then
+              PASS=$(ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "sudo cat /var/lib/jenkins/secrets/initialAdminPassword")
+              jq --arg p "$PASS" '.jenkins_password=$p' state.json > state.tmp && mv state.tmp state.json
+              echo "$PASS"
+              exit 0
+            fi
+            sleep 30
+          done
+
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "sudo systemctl status jenkins --no-pager || true"
+          ssh -i ~/.ssh/jenkins-ec2-key ec2-user@"${PUBLIC_DNS}" "sudo journalctl -u jenkins --no-pager | tail -n 80 || true"
+          exit 1
