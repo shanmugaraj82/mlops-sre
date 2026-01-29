@@ -1,0 +1,273 @@
+# .github/workflows/bedrock-eks-s3-onboarding-agent.yml
+#
+# POC: Deploy an EKS "Onboarding AI Agent" that uses:
+#  - S3 bucket (PDF files) as the knowledge source (RAG-ish retrieval done in app)
+#  - AWS Bedrock for inference
+#  - IRSA (OIDC) for AWS auth (no static AWS keys in the pod)
+#
+# Repo expects:
+#  - Dockerfile at repo root
+#  - app/ (your FastAPI/Flask service)
+#  - k8s/ (manifests below)
+#
+# NOTE: This workflow does NOT create the EKS cluster. It deploys into an existing cluster.
+
+name: Deploy Bedrock + EKS S3-PDF Onboarding Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS Region (e.g., us-east-1)"
+        required: true
+        default: "us-east-1"
+      eks_cluster_name:
+        description: "EKS Cluster name"
+        required: true
+      ecr_repo:
+        description: "ECR repo name (must exist or workflow will create it)"
+        required: true
+        default: "onboarding-agent"
+      k8s_namespace:
+        description: "Kubernetes namespace"
+        required: true
+        default: "onboarding-agent"
+      s3_bucket:
+        description: "S3 bucket holding onboarding PDFs (e.g., my-onboarding-pdf-bucket)"
+        required: true
+      bedrock_model_id:
+        description: "Bedrock modelId (example: anthropic.claude-3-sonnet-20240229-v1:0 or amazon.titan-text-premier-v1)"
+        required: true
+        default: "anthropic.claude-3-sonnet-20240229-v1:0"
+
+permissions:
+  id-token: write      # required for AWS OIDC
+  contents: read
+
+concurrency:
+  group: bedrock-eks-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: onboarding-agent
+  K8S_SA_NAME: onboarding-agent-sa
+  IRSA_ROLE_NAME: onboarding-agent-bedrock-irsa
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- AWS Auth (GitHub OIDC) ----------
+      # Create an AWS IAM role trusted by GitHub OIDC, then store it as a repo secret:
+      #   AWS_OIDC_ROLE_ARN = arn:aws:iam::<acct>:role/<github-actions-oidc-role>
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # ---------- Ensure ECR repo exists ----------
+      - name: Ensure ECR repo exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.ecr_repo }}"
+          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$REPO" >/dev/null
+          echo "ECR repo ready: $REPO"
+
+      # ---------- Build & push image ----------
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGION="${{ inputs.aws_region }}"
+          REPO="${{ inputs.ecr_repo }}"
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${IMAGE_TAG}"
+
+          echo "Building $IMAGE_URI"
+          docker build -t "$IMAGE_URI" .
+
+          echo "Pushing $IMAGE_URI"
+          docker push "$IMAGE_URI"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      # ---------- kubectl / auth to EKS ----------
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Update kubeconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig \
+            --name "${{ inputs.eks_cluster_name }}" \
+            --region "${{ inputs.aws_region }}"
+
+      # ---------- Create namespace ----------
+      - name: Create namespace (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl get ns "${{ inputs.k8s_namespace }}" >/dev/null 2>&1 || \
+            kubectl create ns "${{ inputs.k8s_namespace }}"
+
+      # ---------- Create IRSA role for the K8s ServiceAccount ----------
+      # This step:
+      # 1) reads the EKS OIDC issuer
+      # 2) creates/updates an IAM role trusted by that issuer for the ServiceAccount
+      # 3) attaches a least-privilege policy for:
+      #    - Bedrock InvokeModel
+      #    - S3 GetObject/ListBucket on your PDF bucket
+      #
+      # NOTE: This is a compact POC approach. In production, manage via Terraform.
+      - name: Create/Update IRSA role + policy (Bedrock + S3)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGION="${{ inputs.aws_region }}"
+          CLUSTER="${{ inputs.eks_cluster_name }}"
+          NS="${{ inputs.k8s_namespace }}"
+          SA="${K8S_SA_NAME}"
+          ROLE_NAME="${IRSA_ROLE_NAME}"
+          BUCKET="${{ inputs.s3_bucket }}"
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          OIDC_ISSUER="$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" --query "cluster.identity.oidc.issuer" --output text)"
+          OIDC_HOST="${OIDC_ISSUER#https://}"
+
+          # Discover OIDC provider ARN (must already exist for your cluster)
+          OIDC_PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_HOST}"
+
+          # Trust policy for this namespace/serviceaccount
+          cat > /tmp/trust.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": { "Federated": "${OIDC_PROVIDER_ARN}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${OIDC_HOST}:sub": "system:serviceaccount:${NS}:${SA}",
+                  "${OIDC_HOST}:aud": "sts.amazonaws.com"
+                }
+              }
+            }]
+          }
+          EOF
+
+          # Create role if missing; otherwise update trust policy
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document file:///tmp/trust.json >/dev/null
+          else
+            aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file:///tmp/trust.json >/dev/null
+          fi
+
+          # Inline policy: Bedrock invoke + S3 read PDFs
+          cat > /tmp/perm.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "BedrockInvoke",
+                "Effect": "Allow",
+                "Action": [
+                  "bedrock:InvokeModel",
+                  "bedrock:InvokeModelWithResponseStream"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "S3ReadOnboardingPDFs",
+                "Effect": "Allow",
+                "Action": [
+                  "s3:ListBucket"
+                ],
+                "Resource": "arn:aws:s3:::${BUCKET}"
+              },
+              {
+                "Sid": "S3GetObjects",
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject"
+                ],
+                "Resource": "arn:aws:s3:::${BUCKET}/*"
+              }
+            ]
+          }
+          EOF
+
+          aws iam put-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name "${ROLE_NAME}-inline" \
+            --policy-document file:///tmp/perm.json >/dev/null
+
+          echo "IRSA_ROLE_ARN=arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" >> $GITHUB_ENV
+          echo "IRSA role ready: arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+
+      # ---------- Apply Kubernetes manifests ----------
+      # k8s/ files should include:
+      #  - k8s/serviceaccount.yaml (annotation injected here)
+      #  - k8s/deployment.yaml (image injected here)
+      #  - k8s/service.yaml
+      #  - optional: k8s/ingress.yaml
+      - name: Deploy to EKS (kubectl apply)
+        shell: bash
+        run: |
+          set -euo pipefail
+          NS="${{ inputs.k8s_namespace }}"
+          BUCKET="${{ inputs.s3_bucket }}"
+          MODEL="${{ inputs.bedrock_model_id }}"
+
+          # Patch ServiceAccount with IRSA role arn
+          # If you prefer, keep this annotation directly in k8s/serviceaccount.yaml
+          cat > /tmp/sa.yaml <<EOF
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ${K8S_SA_NAME}
+            namespace: ${NS}
+            annotations:
+              eks.amazonaws.com/role-arn: "${IRSA_ROLE_ARN}"
+          EOF
+          kubectl apply -f /tmp/sa.yaml
+
+          # Apply base manifests
+          kubectl apply -n "$NS" -f k8s/service.yaml
+
+          # Deploy with env vars for S3 bucket and Bedrock model id
+          # This assumes your deployment template references:
+          #  - serviceAccountName: onboarding-agent-sa
+          #  - env: S3_BUCKET, BEDROCK_MODEL_ID
+          # We patch the image + env using kubectl set.
+          kubectl apply -n "$NS" -f k8s/deployment.yaml
+
+          kubectl -n "$NS" set image deploy/${APP_NAME} ${APP_NAME}="${IMAGE_URI}"
+          kubectl -n "$NS" set env deploy/${APP_NAME} S3_BUCKET="${BUCKET}" BEDROCK_MODEL_ID="${MODEL}"
+
+          # Optional ingress
+          if [ -f "k8s/ingress.yaml" ]; then
+            kubectl apply -n "$NS" -f k8s/ingress.yaml
+          fi
+
+      - name: Wait for rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${{ inputs.k8s_namespace }}" rollout status deploy/${APP_NAME} --timeout=300s
+          kubectl -n "${{ inputs.k8s_namespace }}" get pods -o wide
+          kubectl -n "${{ inputs.k8s_namespace }}" get svc
